@@ -1,0 +1,9 @@
+# Iskra with the XFCE desktop (X11 running inside Orbital) instead of Orbital's own taskbar.
+# Experimental: upstream's x11.toml session still has debug switches on.
+# Build: ISKRA_CONFIG=iskra-xfce ./iskra.sh build
+
+include = ["iskra.toml", "x11.toml"]
+
+[general]
+# Filesystem size in MiB: Iskra's 2048 plus room for X11, XFCE and GTK
+filesystem_size = 4096

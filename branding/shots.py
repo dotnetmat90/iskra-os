@@ -2,7 +2,7 @@
 """Boot the Iskra image headless with a virtual VGA display, log in through the GUI
 by sending keystrokes, and save screenshots of the login screen and the desktop.
 
-Usage: branding/shots.py OUTDIR [extra steps...]
+Usage: [ISKRA_CONFIG=iskra] [SHOTS_NO_LOGIN=1 SHOTS_DESKTOP_WAIT=120] branding/shots.py OUTDIR [steps...]
 Each extra step is a number (seconds to wait), "key:<qemu sendkey names>"
 (e.g. key:ctrl-t, key:ret), "type:<text>", "mouse:<dx>,<dy>" (relative move),
 "click", or "shot:<name>" to save a screenshot.
@@ -14,7 +14,7 @@ out = os.path.abspath(sys.argv[1]); os.makedirs(out, exist_ok=True)
 steps = sys.argv[2:]
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 p = subprocess.Popen(
-    ["make", "qemu", "ARCH=x86_64", "CONFIG_NAME=iskra",
+    ["make", "qemu", "ARCH=x86_64", "CONFIG_NAME=" + os.environ.get("ISKRA_CONFIG", "iskra"),
      "QEMU=qemu-system-x86_64 -snapshot -display none -m 4096"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     start_new_session=True)
@@ -60,10 +60,13 @@ try:
     assert pump(300, b"1920x1080"), "no resolution menu"
     pump(2); keys("ret")
     assert pump(900, b"login:"), "no login prompt on serial"
-    pump(25)                      # let orblogin draw
-    shot("1-login")
-    keys("ret")                   # username is pre-filled as "user"; focus is on the empty password
-    pump(40)                      # desktop and launcher start
+    if os.environ.get("SHOTS_NO_LOGIN"):   # session starts without orblogin (e.g. iskra-xfce)
+        pump(float(os.environ.get("SHOTS_DESKTOP_WAIT", "120")))
+    else:
+        pump(25)                      # let orblogin draw
+        shot("1-login")
+        keys("ret")                   # username is pre-filled as "user"; focus is on the empty password
+        pump(40)                      # desktop and launcher start
     shot("2-desktop")
     for s in steps:
         if s.startswith("key:"): keys(s[4:])

@@ -1,0 +1,12 @@
+# Iskra's own small tools (shell scripts). Files under bin/ install to /usr/bin.
+[package]
+description = "Iskra command-line tools (ai, iskra-bar)"
+dependencies = ["curl", "jq", "ca-certificates"]
+
+[build]
+template = "custom"
+script = """
+mkdir -p "${COOKBOOK_STAGE}/usr/bin"
+cp -v "${COOKBOOK_RECIPE}/bin/"* "${COOKBOOK_STAGE}/usr/bin/"
+chmod 755 "${COOKBOOK_STAGE}/usr/bin/"*
+"""

@@ -12,8 +12,10 @@ filesystem_size = 2048
 # upstream marks firefox "compiled, need testing".
 firefox = {}
 webkitgtk3 = {}
-# Built locally so it picks up branding/ui (see recipes/gui/orbdata/recipe.toml).
+# Built locally so it picks up branding/share (see recipes/gui/orbdata/recipe.toml).
 orbdata = "source"
+# Iskra's own tools: `ai` (ask any AI provider from the terminal). Local recipe, always built here.
+iskra-tools = "source"
 
 [[files]]
 path = "/etc/hostname"

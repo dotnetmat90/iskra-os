@@ -1,0 +1,87 @@
+#!/usr/bin/env sh
+# ai: ask the computer a question from the terminal.
+#
+#   ai "how do I list open ports?"
+#   cat error.log | ai "what went wrong?"
+#
+# Settings: ~/.config/iskra/ai.env (KEY=value lines). Pick a provider:
+#   AI_PROVIDER=anthropic   ANTHROPIC_API_KEY=...   (default model claude-opus-5-5)
+#   AI_PROVIDER=openai      OPENAI_API_KEY=...      AI_MODEL=<model id>
+#   AI_PROVIDER=gemini      GEMINI_API_KEY=...      AI_MODEL=<model id>
+#   AI_PROVIDER=openrouter  OPENROUTER_API_KEY=...  AI_MODEL=<vendor/model>
+#   AI_PROVIDER=groq        GROQ_API_KEY=...        AI_MODEL=<model id>
+#   AI_PROVIDER=lmstudio | ollama   AI_HOST=<ip of the machine running it>   AI_MODEL=<model>
+#   AI_PROVIDER=custom      AI_URL=<.../v1/chat/completions>  AI_KEY=...  AI_MODEL=...
+# Without AI_PROVIDER: anthropic if ANTHROPIC_API_KEY is set, else lmstudio.
+# Keys stay on this machine; they are never part of the Iskra image or repository.
+set -eu
+
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/iskra/ai.env"
+[ -f "$conf" ] && . "$conf"
+
+if [ $# -eq 0 ]; then
+  # Print the header comment as help (no sed: it is not in the base image).
+  n=0; while IFS= read -r line; do n=$((n + 1)); [ $n -ge 2 ] && [ $n -le 18 ] && { l=${line#\#}; printf '%s\n' "${l# }"; }; done < "$0"
+  exit 2
+fi
+die() { echo "ai: $*" >&2; exit 1; }
+
+prompt="$*"
+# Piped input becomes context for the question.
+if [ ! -t 0 ]; then
+  prompt="$prompt
+
+<input>
+$(cat)
+</input>"
+fi
+system="You are the assistant built into Iskra, a Rust microkernel OS based on Redox OS. Answer briefly and concretely; the user reads your answer in a terminal or a small panel."
+
+provider="${AI_PROVIDER:-}"
+[ -n "$provider" ] || { [ -n "${ANTHROPIC_API_KEY:-}" ] && provider=anthropic || provider=lmstudio; }
+host="${AI_HOST:-10.0.2.2}"   # QEMU's address for the host machine; set AI_HOST under UTM or on a LAN
+
+if [ "$provider" = anthropic ]; then
+  # Claude's native Messages API. fallbacks retries a declined request on another model.
+  [ -n "${ANTHROPIC_API_KEY:-}" ] || die "set ANTHROPIC_API_KEY in $conf"
+  body=$(jq -n --arg m "${AI_MODEL:-claude-opus-5-5}" --arg s "$system" --arg p "$prompt" \
+    '{model: $m, max_tokens: 16000, system: $s, fallbacks: "default",
+      messages: [{role: "user", content: $p}]}')
+  resp=$(curl -s "${AI_URL:-https://api.anthropic.com/v1/messages}" \
+    -H "content-type: application/json" \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2026-10-21" \
+    -H "anthropic-beta: server-side-fallback-2026-07-01" \
+    -d "$body" 2>/dev/null) || die "could not reach the Claude API"
+  [ "$(printf '%s' "$resp" | jq -r '.type')" = error ] &&
+    die "$(printf '%s' "$resp" | jq -r '.error.type + ": " + .error.message')"
+  [ "$(printf '%s' "$resp" | jq -r '.stop_reason')" = refusal ] &&
+    die "request declined ($(printf '%s' "$resp" | jq -r '.stop_details.category // "no category"'))"
+  printf '%s\n' "$(printf '%s' "$resp" | jq -r '[.content[] | select(.type == "text") | .text] | join("")')"
+  exit 0
+fi
+
+# Everything else speaks the OpenAI-compatible chat completions format.
+case "$provider" in
+  openai)     url=https://api.openai.com/v1/chat/completions;                          key="${OPENAI_API_KEY:-}" ;;
+  gemini)     url=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions; key="${GEMINI_API_KEY:-}" ;;
+  openrouter) url=https://openrouter.ai/api/v1/chat/completions;                        key="${OPENROUTER_API_KEY:-}" ;;
+  groq)       url=https://api.groq.com/openai/v1/chat/completions;                      key="${GROQ_API_KEY:-}" ;;
+  lmstudio)   url="http://$host:1234/v1/chat/completions"; key="" ;;
+  ollama)     url="http://$host:11434/v1/chat/completions"; key="" ;;
+  custom)     url="${AI_URL:-}"; key="" ; [ -n "$url" ] || die "set AI_URL in $conf" ;;
+  *) die "unknown AI_PROVIDER '$provider'" ;;
+esac
+url="${AI_URL:-$url}"; key="${AI_KEY:-$key}"
+model="${AI_MODEL:-}"
+case "$provider" in lmstudio|ollama) model="${model:-local-model}" ;; esac
+[ -n "$model" ] || die "set AI_MODEL in $conf for $provider"
+case "$provider" in lmstudio|ollama|custom) ;; *) [ -n "$key" ] || die "set the $provider API key in $conf" ;; esac
+
+body=$(jq -n --arg m "$model" --arg s "$system" --arg p "$prompt" \
+  '{model: $m, messages: [{role: "system", content: $s}, {role: "user", content: $p}]}')
+resp=$(curl -s "$url" -H "content-type: application/json" \
+  ${key:+-H "authorization: Bearer $key"} -d "$body" 2>/dev/null) || die "could not reach $url"
+printf '%s' "$resp" | jq -e '.choices[0].message.content' >/dev/null 2>&1 ||
+  die "$(printf '%s' "$resp" | jq -r '(if type == "array" then .[0] else . end) | (.error.message? // tostring)' 2>/dev/null || printf '%s' "$resp")"
+printf '%s\n' "$(printf '%s' "$resp" | jq -r '.choices[0].message.content')"
