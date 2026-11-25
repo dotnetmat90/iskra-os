@@ -1,0 +1,75 @@
+# EXPERIMENT: Iskra booting into xfwl4, Xfce's Rust Wayland compositor, running nested inside
+# Orbital through smithay's winit backend (how upstream's wayland.toml runs cosmic-comp).
+# Build: ISKRA_CONFIG=iskra-xfwl4 ./iskra.sh build
+# Needs build/iskra-src prepared as described in recipes/iskra/xfwl4/recipe.toml.
+
+include = ["iskra.toml"]
+
+[general]
+filesystem_size = 3072
+
+[packages]
+xfwl4 = "source"
+libxfce4ui = "source"   # 4.21.4: keyboard-shortcut API xfwl4 uses
+xfconf = "source"       # 4.21.2
+dbus = {}
+libwayland = {}
+libxkbcommon = {}
+xkeyboard-config = {}
+adwaita-icon-theme = {}
+xfwm4 = {}              # provides the "Default" window decoration theme xfwl4 loads
+"pop-icon-theme.cursors" = {}
+# Small Wayland test client used as the session app below.
+winit-wayland = {}
+
+[[files]]
+path = "/usr/lib/init.d/10_dbus"
+data = """
+requires_weak 10_net.target
+bash /usr/bin/start-dbus.sh
+"""
+
+[[files]]
+path = "/usr/bin/start-dbus.sh"
+mode = 0o755
+data = """
+#!/usr/bin/env bash
+mkdir -p /var/lib/dbus /run/dbus
+dbus-uuidgen --ensure
+rm -f /run/dbus/pid
+dbus-daemon --system
+"""
+
+# Start xfwl4 instead of the Orbital login screen.
+[[files]]
+path = "/usr/lib/init.d/20_orbital"
+data = """
+requires_weak 10_net.target 10_dbus 20_audiod.service
+nowait VT=3 orbital iskra-xfwl4-session
+"""
+
+[[files]]
+path = "/usr/bin/iskra-xfwl4-session"
+mode = 0o755
+data = """
+#!/usr/bin/env bash
+set -x
+export HOME=/root
+export XDG_RUNTIME_DIR=/tmp/run/user/0
+export XCURSOR_THEME=Pop
+export RUST_LOG=info
+export RUST_BACKTRACE=1
+mkdir -p /tmp/run /tmp/run/user /tmp/run/user/0
+glib-compile-schemas /usr/share/glib-2.0/schemas/ || true
+# D-Bus service activation fails on Redox ("Failed to read from child pipe"), so start the
+# xfconf daemon ourselves inside the session bus before xfwl4 asks for it.
+exec dbus-run-session -- bash -c '/usr/lib/xfce4/xfconf/xfconfd & sleep 3; exec xfwl4 --backend winit --session winit-wayland_window'
+"""
+
+# dbus-daemon --system runs as this user (same as upstream x11.toml).
+[users.messagebus]
+uid = 100
+gid = 100
+name = "messagebus"
+home = "/nonexistent"
+shell = "/usr/bin/false"

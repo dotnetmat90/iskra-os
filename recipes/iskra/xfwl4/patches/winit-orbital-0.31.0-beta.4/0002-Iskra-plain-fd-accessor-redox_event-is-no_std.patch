@@ -1,0 +1,25 @@
+From 621dd2fee98c45dfa8ea84123b00acd7cce971e3 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 23:10:13 +0100
+Subject: [PATCH 2/2] Iskra: plain fd accessor (redox_event is no_std)
+
+---
+ src/event_loop.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/event_loop.rs b/src/event_loop.rs
+index 651f55b..9f30a91 100644
+--- a/src/event_loop.rs
++++ b/src/event_loop.rs
+@@ -906,7 +906,7 @@ fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+ // Iskra: expose the event queue so smithay/calloop can poll this loop (with pump_app_events).
+ impl std::os::fd::AsRawFd for EventLoop {
+     fn as_raw_fd(&self) -> std::os::fd::RawFd {
+-        std::os::fd::AsRawFd::as_raw_fd(&*self.window_target.event_socket)
++        self.window_target.event_socket.raw().fd() as std::os::fd::RawFd
+     }
+ }
+ impl std::os::fd::AsFd for EventLoop {
+-- 
+2.43.0
+

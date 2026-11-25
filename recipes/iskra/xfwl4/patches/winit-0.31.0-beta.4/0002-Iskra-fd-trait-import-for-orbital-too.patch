@@ -1,0 +1,25 @@
+From 98813b4d4621973662b977e52526b808619360bf Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 23:09:34 +0100
+Subject: [PATCH 2/2] Iskra: fd trait import for orbital too
+
+---
+ src/event_loop.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/event_loop.rs b/src/event_loop.rs
+index 9c230a6..b879d97 100644
+--- a/src/event_loop.rs
++++ b/src/event_loop.rs
+@@ -9,7 +9,7 @@
+ //! See the root-level documentation for information on how to create and use an event loop to
+ //! handle events.
+ use std::marker::PhantomData;
+-#[cfg(any(x11_platform, wayland_platform))]
++#[cfg(any(x11_platform, wayland_platform, orbital_platform))]
+ use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
+ 
+ use rwh_06::{DisplayHandle, HandleError, HasDisplayHandle};
+-- 
+2.43.0
+

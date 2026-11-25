@@ -1,0 +1,35 @@
+From a50162a9ebd495fd907a2651924b58cdf5fee738 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 23:10:13 +0100
+Subject: [PATCH 2/2] Iskra: plain fd accessor (redox_event is no_std)
+
+---
+ src/wrappers.rs | 13 ++++---------
+ 1 file changed, 4 insertions(+), 9 deletions(-)
+
+diff --git a/src/wrappers.rs b/src/wrappers.rs
+index 7b55253..0e74217 100644
+--- a/src/wrappers.rs
++++ b/src/wrappers.rs
+@@ -177,14 +177,9 @@ impl<U: UserData> Iterator for EventQueue<U> {
+ unsafe impl<U: UserData> Send for EventQueue<U> {}
+ unsafe impl<U: UserData> Sync for EventQueue<U> {}
+ 
+-// Iskra: let other event loops (calloop via winit) watch this queue.
+-impl std::os::fd::AsRawFd for RawEventQueue {
+-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+-        self.inner as std::os::fd::RawFd
+-    }
+-}
+-impl<U: UserData> std::os::fd::AsRawFd for EventQueue<U> {
+-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+-        self.inner.as_raw_fd()
++// Iskra: let other event loops (calloop via winit) watch this queue. no_std, so a plain accessor.
++impl RawEventQueue {
++    pub fn fd(&self) -> usize {
++        self.inner
+     }
+ }
+-- 
+2.43.0
+

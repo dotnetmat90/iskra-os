@@ -1,0 +1,62 @@
+# EXPERIMENT: Xfce's Rust Wayland compositor (xfwl4), nested inside Orbital through
+# smithay's winit backend, the same way Redox's cosmic-comp port runs.
+# Needs a smithay with Redox patches at the commit xfwl4 pins: Redox's fork
+# (github.com/jackpot51/smithay, branch redox) rebased onto that commit, checked out at
+# build/iskra-src/smithay (see PLAN.md, "xfwl4 experiment").
+[source]
+git = "https://gitlab.xfce.org/xfce/xfwl4.git"
+shallow_clone = true
+
+[build]
+template = "custom"
+dependencies = [
+    "gettext",
+    "gtk3",
+    "libffi",
+    "libwayland",
+    "libxfce4ui",
+    "libxkbcommon",
+    "mesa",
+    "pixman",
+    "xfconf",
+]
+script = """
+DYNAMIC_INIT
+ISKRA_SRC=/mnt/redox/build/iskra-src
+SMITHAY="${ISKRA_SRC}/smithay"
+# Use Redox's gettext instead of building a bundled copy (same as cosmic-store's recipe).
+export GETTEXT_DIR="${COOKBOOK_SYSROOT}/usr"
+# xfwl4 needs libxfce4ui >= 4.21.4 and xfconf >= 4.21.2; config/iskra-xfce.toml builds those
+# from source (recipes bumped in recipes/wip/x11/xfce4/).
+# xfwl4 bug without its xwayland feature: WindowSurface is used everywhere but imported only
+# under cfg(feature = "xwayland"). smithay defines the type regardless, so drop the gate.
+sed -i '/^#\\[cfg(feature = "xwayland")\\]$/{N;s/^#\\[cfg(feature = "xwayland")\\]\\nuse smithay::desktop::WindowSurface;/use smithay::desktop::WindowSurface;/}' "${COOKBOOK_SOURCE}/src/core/shell/mod.rs"
+grep -n -B1 "^use smithay::desktop::WindowSurface;" "${COOKBOOK_SOURCE}/src/core/shell/mod.rs"
+# Same bug: PointerFocusTarget::X11Surface only exists with xwayland. We build without it.
+sed -i 's/PointerFocusTarget::WlSurface(_) | PointerFocusTarget::X11Surface(_)/PointerFocusTarget::WlSurface(_)/' "${COOKBOOK_SOURCE}/src/core/input_handler.rs"
+# Proc macros (e.g. gdbus-codegen-macros) are built for the build host and link host GLib.
+# Give the host target its own pkg-config settings so it stops seeing Redox's sysroot.
+HOST="${COOKBOOK_HOST_TARGET//-/_}"
+export "PKG_CONFIG_${HOST}=pkg-config"
+export "PKG_CONFIG_PATH_${HOST}="
+export "PKG_CONFIG_SYSROOT_DIR_${HOST}=/"
+export "PKG_CONFIG_LIBDIR_${HOST}=$(env -u PKG_CONFIG_LIBDIR -u PKG_CONFIG_PATH -u PKG_CONFIG_SYSROOT_DIR pkg-config --variable pc_path pkg-config)"
+env | grep "^PKG_CONFIG_.*${HOST}"
+PATCHES=(
+    --config "patch.'https://github.com/smithay/smithay'.smithay.path='${SMITHAY}'"
+    --config "patch.'https://github.com/smithay/smithay'.smithay-drm-extras.path='${SMITHAY}/smithay-drm-extras'"
+    # winit's Orbital event loop must expose its fd so smithay can poll it (patch_event_fd.py).
+    --config "patch.crates-io.winit.path='${ISKRA_SRC}/winit-0.31.0-beta.4'"
+    --config "patch.crates-io.winit-orbital.path='${ISKRA_SRC}/winit-orbital-0.31.0-beta.4'"
+    --config "patch.crates-io.redox_event.path='${ISKRA_SRC}/redox_event-0.4.8'"
+)
+# drm 0.14.1 uses rustix::fs::major/minor, which Redox lacks; Redox's cosmic-comp builds with 0.14.2.
+cargo update "${PATCHES[@]}" --manifest-path "${COOKBOOK_SOURCE}/Cargo.toml" -p drm --precise 0.14.2
+# Data paths are baked in at build time from PREFIX (default /usr/local).
+export PREFIX=/usr
+# xfwl4 uses smithay's pixman renderer unconditionally but only its udev feature enables it.
+cookbook_cargo --no-default-features --features winit,egl,gettext-system,smithay/renderer_pixman "${PATCHES[@]}"
+# cargo install only copies the binary; meson would also install the defaults file.
+mkdir -p "${COOKBOOK_STAGE}/usr/share/xfce4/xfwl4"
+cp -v "${COOKBOOK_SOURCE}/resources/defaults" "${COOKBOOK_STAGE}/usr/share/xfce4/xfwl4/"
+"""

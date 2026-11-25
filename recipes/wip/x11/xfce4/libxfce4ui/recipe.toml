@@ -1,6 +1,6 @@
 [source]
-tar = "https://archive.xfce.org/src/xfce/libxfce4ui/4.21/libxfce4ui-4.21.2.tar.xz"
-blake3 = "027adb15e74b6df534bc526ec0e1056fede33cf2e69ce802391fb1f714350015"
+tar = "https://archive.xfce.org/src/xfce/libxfce4ui/4.21/libxfce4ui-4.21.4.tar.xz"
+blake3 = "30213bc2882d8e9c57c66532bf4d4f8bb57d18a2036ada7dcc5d4655abf45bd0"
 
 [build]
 dependencies = [
@@ -41,7 +41,12 @@ dependencies = [
     "xfconf",
     "zlib",
 ]
-template = "meson"
-mesonflags = [
-    "-Dintrospection=false",
-]
+# 4.21.4 tarball does not bundle xdt-gen-visibility (from xfce4-dev-tools); use the copy
+# shipped with xfconf, kept next to this recipe.
+template = "custom"
+script = """
+DYNAMIC_INIT
+export PATH="${COOKBOOK_RECIPE}:${PATH}"
+COOKBOOK_MESON_FLAGS+=(-Dintrospection=false)
+cookbook_meson
+"""

@@ -1,0 +1,34 @@
+From 33bb86517d4e4bbe60d33094b26983d2d471706b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 23:09:44 +0100
+Subject: [PATCH 5/5] winit 0.31 names the Super keys MetaLeft/MetaRight
+
+---
+ src/backend/winit/mod.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/winit/mod.rs b/src/backend/winit/mod.rs
+index ff16f6a1..5af06c41 100644
+--- a/src/backend/winit/mod.rs
++++ b/src/backend/winit/mod.rs
+@@ -925,7 +925,7 @@ mod redox_keymap {
+             K::NumpadDivide => 98, K::PrintScreen => 99, K::AltRight => 100, K::Home => 102,
+             K::ArrowUp => 103, K::PageUp => 104, K::ArrowLeft => 105, K::ArrowRight => 106,
+             K::End => 107, K::ArrowDown => 108, K::PageDown => 109, K::Insert => 110,
+-            K::Delete => 111, K::Pause => 119, K::SuperLeft => 125, K::SuperRight => 126,
++            K::Delete => 111, K::Pause => 119, K::MetaLeft => 125, K::MetaRight => 126,
+             K::ContextMenu => 127,
+             _ => 0,
+         }
+@@ -938,7 +938,7 @@ mod redox_keymap {
+         fn common_keys_match_linux_codes() {
+             assert_eq!(linux_keycode(PhysicalKey::Code(K::KeyA)), 30);
+             assert_eq!(linux_keycode(PhysicalKey::Code(K::Enter)), 28);
+-            assert_eq!(linux_keycode(PhysicalKey::Code(K::SuperLeft)), 125);
++            assert_eq!(linux_keycode(PhysicalKey::Code(K::MetaLeft)), 125);
+             assert_eq!(linux_keycode(PhysicalKey::Code(K::ArrowDown)), 108);
+         }
+     }
+-- 
+2.43.0
+

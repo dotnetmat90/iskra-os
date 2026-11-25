@@ -1,6 +1,6 @@
 [source]
-tar = "https://archive.xfce.org/src/xfce/xfconf/4.21/xfconf-4.21.0.tar.xz"
-blake3 = "588bc6768775221a50d8cdd8480854a360b1343193115b639daf225aa34b97d7"
+tar = "https://archive.xfce.org/src/xfce/xfconf/4.21/xfconf-4.21.2.tar.xz"
+blake3 = "aedf6076dac8263551b065133b4634c557f42ddf0925de51cd110a1259aefc15"
 
 [build]
 dependencies = [

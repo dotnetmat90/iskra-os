@@ -1,0 +1,91 @@
+From 5cb00891c21fae10544a01816f22d6df7f1e87b0 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 23:07:12 +0100
+Subject: [PATCH 4/5] winit backend on Redox: map winit key names to Linux key
+ codes (winit has no scancode extension there)
+
+---
+ src/backend/winit/mod.rs | 55 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/src/backend/winit/mod.rs b/src/backend/winit/mod.rs
+index 7b0ffc89..ff16f6a1 100644
+--- a/src/backend/winit/mod.rs
++++ b/src/backend/winit/mod.rs
+@@ -29,6 +29,7 @@ use tracing::{debug, info, info_span, instrument, trace, warn};
+ use wayland_egl as wegl;
+ use winit::dpi::LogicalPosition;
+ use winit::event::TouchPhase;
++#[cfg(not(target_os = "redox"))]
+ use winit::platform::scancode::PhysicalKeyExtScancode;
+ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+ use winit::{
+@@ -578,7 +579,11 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
+                     }
+                 };
+ 
++                #[cfg(not(target_os = "redox"))]
+                 let scancode = event.physical_key.to_scancode().unwrap_or(0);
++                // winit has no scancode extension on Redox: translate key names to Linux key codes.
++                #[cfg(target_os = "redox")]
++                let scancode = redox_keymap::linux_keycode(event.physical_key);
+                 let event = InputEvent::Keyboard {
+                     event: WinitKeyboardInputEvent {
+                         time: self.timestamp(),
+@@ -888,3 +893,53 @@ pub enum WinitEvent {
+     /// A redraw was requested
+     Redraw,
+ }
++
++/// Linux evdev key codes for winit key names, for Redox where winit exposes no scancodes.
++/// Codes are from linux/input-event-codes.h. Unmapped keys become 0 (ignored).
++#[cfg(target_os = "redox")]
++mod redox_keymap {
++    use winit::keyboard::{KeyCode as K, PhysicalKey};
++
++    pub fn linux_keycode(key: PhysicalKey) -> u32 {
++        let PhysicalKey::Code(code) = key else { return 0 };
++        match code {
++            K::Escape => 1, K::Digit1 => 2, K::Digit2 => 3, K::Digit3 => 4, K::Digit4 => 5,
++            K::Digit5 => 6, K::Digit6 => 7, K::Digit7 => 8, K::Digit8 => 9, K::Digit9 => 10,
++            K::Digit0 => 11, K::Minus => 12, K::Equal => 13, K::Backspace => 14, K::Tab => 15,
++            K::KeyQ => 16, K::KeyW => 17, K::KeyE => 18, K::KeyR => 19, K::KeyT => 20,
++            K::KeyY => 21, K::KeyU => 22, K::KeyI => 23, K::KeyO => 24, K::KeyP => 25,
++            K::BracketLeft => 26, K::BracketRight => 27, K::Enter => 28, K::ControlLeft => 29,
++            K::KeyA => 30, K::KeyS => 31, K::KeyD => 32, K::KeyF => 33, K::KeyG => 34,
++            K::KeyH => 35, K::KeyJ => 36, K::KeyK => 37, K::KeyL => 38, K::Semicolon => 39,
++            K::Quote => 40, K::Backquote => 41, K::ShiftLeft => 42, K::Backslash => 43,
++            K::KeyZ => 44, K::KeyX => 45, K::KeyC => 46, K::KeyV => 47, K::KeyB => 48,
++            K::KeyN => 49, K::KeyM => 50, K::Comma => 51, K::Period => 52, K::Slash => 53,
++            K::ShiftRight => 54, K::NumpadMultiply => 55, K::AltLeft => 56, K::Space => 57,
++            K::CapsLock => 58, K::F1 => 59, K::F2 => 60, K::F3 => 61, K::F4 => 62, K::F5 => 63,
++            K::F6 => 64, K::F7 => 65, K::F8 => 66, K::F9 => 67, K::F10 => 68,
++            K::NumLock => 69, K::ScrollLock => 70, K::Numpad7 => 71, K::Numpad8 => 72,
++            K::Numpad9 => 73, K::NumpadSubtract => 74, K::Numpad4 => 75, K::Numpad5 => 76,
++            K::Numpad6 => 77, K::NumpadAdd => 78, K::Numpad1 => 79, K::Numpad2 => 80,
++            K::Numpad3 => 81, K::Numpad0 => 82, K::NumpadDecimal => 83, K::IntlBackslash => 86,
++            K::F11 => 87, K::F12 => 88, K::NumpadEnter => 96, K::ControlRight => 97,
++            K::NumpadDivide => 98, K::PrintScreen => 99, K::AltRight => 100, K::Home => 102,
++            K::ArrowUp => 103, K::PageUp => 104, K::ArrowLeft => 105, K::ArrowRight => 106,
++            K::End => 107, K::ArrowDown => 108, K::PageDown => 109, K::Insert => 110,
++            K::Delete => 111, K::Pause => 119, K::SuperLeft => 125, K::SuperRight => 126,
++            K::ContextMenu => 127,
++            _ => 0,
++        }
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++        #[test]
++        fn common_keys_match_linux_codes() {
++            assert_eq!(linux_keycode(PhysicalKey::Code(K::KeyA)), 30);
++            assert_eq!(linux_keycode(PhysicalKey::Code(K::Enter)), 28);
++            assert_eq!(linux_keycode(PhysicalKey::Code(K::SuperLeft)), 125);
++            assert_eq!(linux_keycode(PhysicalKey::Code(K::ArrowDown)), 108);
++        }
++    }
++}
+-- 
+2.43.0
+

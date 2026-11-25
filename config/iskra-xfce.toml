@@ -10,6 +10,12 @@ include = ["iskra.toml", "x11.toml"]
 # Filesystem size in MiB: Iskra's 2048 plus room for X11, XFCE and GTK
 filesystem_size = 4096
 
+[packages]
+# xfwl4 experiment: newer XFCE libraries than upstream publishes, built here.
+libxfce4ui = "source"   # 4.21.4: keyboard-shortcut API xfwl4 uses
+xfconf = "source"       # 4.21.2
+xfwl4 = "source"
+
 # Replaces upstream's session script: start the window manager, panel and desktop
 # directly so each one's errors reach the boot log (xfce4-session hid xfwm4's failure).
 [[files]]

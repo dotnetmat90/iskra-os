@@ -1,0 +1,24 @@
+From 70823a8897537172655b773287aab472bb4e1cc7 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 22:57:32 +0100
+Subject: [PATCH 2/5] Drop unused import
+
+---
+ src/backend/winit/mod.rs | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/backend/winit/mod.rs b/src/backend/winit/mod.rs
+index 7f0d7364..7b0ffc89 100644
+--- a/src/backend/winit/mod.rs
++++ b/src/backend/winit/mod.rs
+@@ -20,7 +20,6 @@
+ 
+ use std::io::Error as IoError;
+ use std::mem;
+-use std::os::fd::{FromRawFd, RawFd};
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+-- 
+2.43.0
+

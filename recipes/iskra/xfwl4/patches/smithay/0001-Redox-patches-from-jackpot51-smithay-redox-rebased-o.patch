@@ -1,0 +1,229 @@
+From ba5c926d32dd8b53a0f1e8074277ad8de49e4f03 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 22:57:24 +0100
+Subject: [PATCH 1/5] Redox patches (from jackpot51/smithay redox) rebased onto
+ d09642cc for xfwl4
+
+---
+ Cargo.toml                      | 12 +++++++
+ build.rs                        |  2 ++
+ smallvil/src/winit.rs           |  4 +++
+ src/backend/allocator/dmabuf.rs |  2 ++
+ src/backend/egl/native.rs       | 62 ++++++++++++++++++++++++++++++++-
+ src/backend/winit/mod.rs        | 17 +++++++--
+ src/wayland/shm/pool.rs         |  4 +--
+ 7 files changed, 98 insertions(+), 5 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 7a4dbfbe..a86920df 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -148,3 +148,15 @@ harness = false
+ [profile.release-with-debug]
+ inherits = "release"
+ debug = true
++
++[patch.crates-io]
++wayland-backend = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-client = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-cursor = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-egl = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-protocols = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-protocols-misc = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-protocols-wlr = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-server = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++wayland-sys = { git = "https://github.com/jackpot51/wayland-rs.git", branch = "redox" }
++winit = { git = "https://github.com/jackpot51/winit.git", branch = "redox-0.30" }
+diff --git a/build.rs b/build.rs
+index 45277f03..8c8c2b1b 100644
+--- a/build.rs
++++ b/build.rs
+@@ -31,6 +31,8 @@ fn gl_generate() {
+                 "EGL_EXT_platform_x11",
+                 "EGL_KHR_platform_wayland",
+                 "EGL_EXT_platform_wayland",
++                "EGL_KHR_platform_redox",
++                "EGL_EXT_platform_redox",
+                 "EGL_KHR_platform_gbm",
+                 "EGL_MESA_platform_gbm",
+                 "EGL_MESA_platform_surfaceless",
+diff --git a/smallvil/src/winit.rs b/smallvil/src/winit.rs
+index 190c1554..7de9b34f 100644
+--- a/smallvil/src/winit.rs
++++ b/smallvil/src/winit.rs
+@@ -43,6 +43,10 @@ pub fn init_winit(
+ 
+     let mut damage_tracker = OutputDamageTracker::from_output(&output);
+ 
++    // Orbital on Redox requires a first redraw request
++    #[cfg(target_os = "redox")]
++    backend.window().request_redraw();
++
+     event_loop.handle().insert_source(winit, move |event, _, state| {
+         match event {
+             WinitEvent::Resized { size, .. } => {
+diff --git a/src/backend/allocator/dmabuf.rs b/src/backend/allocator/dmabuf.rs
+index 405e544b..ffaa85ce 100644
+--- a/src/backend/allocator/dmabuf.rs
++++ b/src/backend/allocator/dmabuf.rs
+@@ -321,6 +321,7 @@ impl Dmabuf {
+             .planes
+             .get(idx)
+             .ok_or(DmabufSyncFailed::PlaneIndexOutOfBound)?;
++        #[cfg(not(target_os = "redox"))]
+         unsafe { rustix::ioctl::ioctl(&plane.fd, Setter::<DMA_BUF_SYNC, _>::new(dma_buf_sync { flags })) }
+             .map_err(std::io::Error::from)?;
+         Ok(())
+@@ -399,6 +400,7 @@ struct dma_buf_sync {
+     flags: DmabufSyncFlags,
+ }
+ 
++#[cfg(not(target_os = "redox"))]
+ const DMA_BUF_SYNC: rustix::ioctl::Opcode = rustix::ioctl::opcode::write::<dma_buf_sync>(b'b', 0);
+ 
+ /// A mapping into a [`Dmabuf`]
+diff --git a/src/backend/egl/native.rs b/src/backend/egl/native.rs
+index b98b94f7..389b8577 100644
+--- a/src/backend/egl/native.rs
++++ b/src/backend/egl/native.rs
+@@ -214,7 +214,41 @@ impl EGLNativeDisplay for Arc<dyn WinitWindow> {
+                     ),
+                 ]
+             }
+-            _ => unreachable!("No backends for winit other then Wayland and X11 are supported"),
++            Ok(raw_window_handle::RawDisplayHandle::Orbital(handle)) => {
++                let display = &raw const handle;
++                //TODO: submit to EGL registry when ready
++                const PLATFORM_REDOX_KHR: ffi::egl::types::EGLenum = 0x31D9;
++                const PLATFORM_REDOX_EXT: ffi::egl::types::EGLenum = 0x31D9;
++                vec![
++                    EGLPlatform::new(
++                        PLATFORM_REDOX_KHR,
++                        stringify!(PLATFORM_REDOX_KHR),
++                        display as *mut _,
++                        vec![ffi::egl::NONE as ffi::EGLint],
++                        &["EGL_KHR_platform_redox"],
++                    ),
++                    EGLPlatform::new(
++                        PLATFORM_REDOX_EXT,
++                        stringify!(PLATFORM_REDOX_EXT),
++                        display as *mut _,
++                        vec![ffi::egl::NONE as ffi::EGLint],
++                        &["EGL_EXT_platform_redox"],
++                    ),
++                    egl_platform!(
++                        PLATFORM_ANGLE_ANGLE,
++                        display,
++                        &["EGL_ANGLE_platform_angle", "EGL_ANGLE_platform_angle_vulkan"],
++                        vec![
++                            ffi::egl::PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE,
++                            PLATFORM_REDOX_EXT as _,
++                            ffi::egl::PLATFORM_ANGLE_TYPE_ANGLE,
++                            ffi::egl::PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
++                            ffi::egl::NONE as ffi::EGLint
++                        ]
++                    ),
++                ]
++            }
++            _ => unreachable!("No backends for winit other then Wayland, X11, and Orbital are supported"),
+         }
+     }
+ }
+@@ -423,3 +457,29 @@ unsafe impl EGLNativeSurface for wegl::WlEglSurface {
+         Some("Winit/Wayland".into())
+     }
+ }
++
++#[cfg(feature = "backend_winit")]
++#[derive(Debug)]
++pub struct OrbitalWindow(pub usize);
++
++#[cfg(feature = "backend_winit")]
++unsafe impl EGLNativeSurface for OrbitalWindow {
++    unsafe fn create(
++        &self,
++        display: &Arc<EGLDisplayHandle>,
++        config_id: ffi::egl::types::EGLConfig,
++    ) -> Result<*const c_void, super::EGLError> {
++        wrap_egl_call_ptr(|| unsafe {
++            ffi::egl::CreatePlatformWindowSurfaceEXT(
++                display.handle,
++                config_id,
++                self.0 as *mut _,
++                WINIT_SURFACE_ATTRIBUTES.as_ptr(),
++            )
++        })
++    }
++
++    fn identifier(&self) -> Option<String> {
++        Some("Winit/Orbital".into())
++    }
++}
+\ No newline at end of file
+diff --git a/src/backend/winit/mod.rs b/src/backend/winit/mod.rs
+index 80e0cb52..7f0d7364 100644
+--- a/src/backend/winit/mod.rs
++++ b/src/backend/winit/mod.rs
+@@ -20,6 +20,7 @@
+ 
+ use std::io::Error as IoError;
+ use std::mem;
++use std::os::fd::{FromRawFd, RawFd};
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+@@ -144,7 +145,7 @@ where
+ 
+     window_event_loop_inner.is_x11 = matches!(
+         window.window_handle().map(|handle| handle.as_raw()),
+-        Ok(RawWindowHandle::Xlib(_))
++        Ok(RawWindowHandle::Xlib(_)) | Ok(RawWindowHandle::Orbital(_))
+     );
+ 
+     span.record("window", window.id().into_raw());
+@@ -267,7 +268,19 @@ where
+                         .map_err(EGLError::CreationFailed)?
+                     }
+                 }
+-                _ => panic!("only running on Wayland or with Xlib is supported"),
++                Ok(RawWindowHandle::Orbital(handle)) => {
++                    debug!("Winit backend: Orbital");
++                    unsafe {
++                        EGLSurface::new(
++                            &display,
++                            context.pixel_format().unwrap(),
++                            context.config_id(),
++                            native::OrbitalWindow(handle.window.as_ptr() as usize),
++                        )
++                        .map_err(EGLError::CreationFailed)?
++                    }
++                }
++                _ => panic!("only running on Wayland, Orbital, or with Xlib is supported"),
+             };
+ 
+             let _ = context.unbind();
+diff --git a/src/wayland/shm/pool.rs b/src/wayland/shm/pool.rs
+index b52e731b..30b62d86 100644
+--- a/src/wayland/shm/pool.rs
++++ b/src/wayland/shm/pool.rs
+@@ -350,7 +350,7 @@ extern "C" fn sigbus_handler(_signum: libc::c_int, info: *mut libc::siginfo_t, _
+ /// SAFETY:
+ /// The returned pointer points to a struct. Make sure that you use it
+ /// appropriately.
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
+ unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> *mut libc::c_void {
+     #[repr(C)]
+     #[allow(non_camel_case_types)]
+@@ -362,7 +362,7 @@ unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> *mut libc::c_void {
+     unsafe { (*(info as *const siginfo_t)).si_addr }
+ }
+ 
+-#[cfg(not(any(target_os = "linux", target_os = "android")))]
++#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "redox")))]
+ unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> *mut libc::c_void {
+     unsafe { (*info).si_addr as _ }
+ }
+-- 
+2.43.0
+
