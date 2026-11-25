@@ -1,3 +1,5 @@
+> **This is Iskra, an independent fork based on Redox OS. It is not affiliated with or endorsed by the Redox OS nonprofit.** See [ISKRA.md](ISKRA.md). The upstream README follows unchanged.
+
 <p align="center">
 <img alt="Redox" width="346" src="https://gitlab.redox-os.org/redox-os/assets/raw/master/logos/redox/logo.png">
 </p>

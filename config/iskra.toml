@@ -1,0 +1,39 @@
+# Iskra image: the upstream desktop plus Iskra identity.
+# Iskra is an independent fork and is not affiliated with or endorsed by the Redox OS nonprofit.
+
+include = ["desktop.toml"]
+
+[general]
+# Filesystem size in MiB
+filesystem_size = 650
+
+[[files]]
+path = "/etc/hostname"
+data = "iskra"
+
+# Pre-login banner; replaces the one shipped in the userutils package.
+[[files]]
+path = "/etc/issue"
+data = """
+############ Iskra ############
+# Based on Redox OS           #
+# Login with the following:   #
+# `user`                      #
+# `root`:`password`           #
+###############################
+
+"""
+
+# https://www.freedesktop.org/software/systemd/man/latest/os-release.html
+[[files]]
+path = "/usr/lib/os-release"
+data = """
+PRETTY_NAME="Iskra 0.1.0"
+NAME="Iskra"
+VERSION_ID="0.1.0"
+VERSION="0.1.0"
+ID="iskra"
+ID_LIKE="redox-os"
+
+HOME_URL="https://github.com/dotnetmat90/iskra-os"
+"""
