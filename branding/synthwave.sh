@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Renders the Iskra synthwave artwork with ImageMagick 7: dusk sky, striped sun,
 # perspective grid, chrome "ISKRA" lettering.
-# Usage: synthwave.sh WIDTH HEIGHT OUTPUT [FONT]
+# Usage: [HORIZON_PCT=60] [SUN_PCT=24] synthwave.sh WIDTH HEIGHT OUTPUT [FONT]
 set -euo pipefail
 W=$1 H=$2 OUT=$3
 FONT=${4:-"/System/Library/Fonts/Supplemental/Arial Black.ttf"}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
-HZ=$((H * 60 / 100))   # horizon line
-SR=$((H * 24 / 100))   # sun radius
+HZ=$((H * ${HORIZON_PCT:-60} / 100))   # horizon line
+SR=$((H * ${SUN_PCT:-24} / 100))   # sun radius
 SY=$((HZ - SR * 35 / 100))  # sun centre: mostly above the horizon
 CX=$((W / 2))
 LW=$(( (H + 539) / 540 ))   # grid line width, 1px at 540p

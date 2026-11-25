@@ -1,0 +1,17 @@
+cursor = "/usr/share/ui/left_ptr.png"
+bottom_left_corner = "/usr/share/ui/bottom_left_corner.png"
+bottom_right_corner = "/usr/share/ui/bottom_right_corner.png"
+bottom_side = "/usr/share/ui/bottom_side.png"
+left_side = "/usr/share/ui/left_side.png"
+right_side = "/usr/share/ui/right_side.png"
+window_max = "/usr/share/ui/window_max.png"
+window_max_unfocused = "/usr/share/ui/window_max_unfocused.png"
+window_close = "/usr/share/ui/window_close.png"
+window_close_unfocused = "/usr/share/ui/window_close_unfocused.png"
+
+# Iskra synthwave palette. Colours are 0xAARRGGBB.
+background_color = { data = 0xFF0B0221 }      # behind the wallpaper
+bar_color = { data = 0xE61A0B2E }             # title bar, unfocused window
+bar_highlight_color = { data = 0xF04A1270 }   # title bar, focused window
+text_color = { data = 0xFFB9A8D9 }            # title text, unfocused
+text_highlight_color = { data = 0xFF7EF9FF }  # title text, focused

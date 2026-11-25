@@ -8,7 +8,7 @@ git = "https://gitlab.redox-os.org/redox-os/orbdata.git"
 template = "custom"
 script = """
 cp -rv "${COOKBOOK_SOURCE}/"* "${COOKBOOK_STAGE}/"
-# Iskra: replace UI artwork (wallpaper, login screen) with the fork's own.
-ISKRA_UI="${COOKBOOK_RECIPE}/../../../branding/ui"
-if [ -d "${ISKRA_UI}" ]; then cp -v "${ISKRA_UI}/"* "${COOKBOOK_STAGE}/usr/share/ui/"; fi
+# Iskra: branding/share mirrors /usr/share; its files replace upstream's (artwork, icons, theme).
+ISKRA_SHARE="${COOKBOOK_RECIPE}/../../../branding/share"
+if [ -d "${ISKRA_SHARE}" ]; then cp -rv "${ISKRA_SHARE}/." "${COOKBOOK_STAGE}/usr/share/"; fi
 """
