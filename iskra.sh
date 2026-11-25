@@ -40,6 +40,8 @@ setup)
   ;;
 build)
   printf 'ARCH?=%s\nCONFIG_NAME?=%s\nREPO_BINARY?=1\nPODMAN_BUILD?=1\nFSTOOLS_IN_PODMAN?=1\n' "$ARCH" "$CONFIG" > .config
+  # orbdata copies branding/ui at build time; drop its old output so artwork changes are picked up.
+  rm -rf recipes/gui/orbdata/target
   # CI=1 turns off the cookbook's full-screen progress view, which crashes without a terminal.
   make all CI=1
   ls -lh "$BUILD/harddrive.img"

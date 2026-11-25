@@ -4,8 +4,16 @@
 include = ["desktop.toml"]
 
 [general]
-# Filesystem size in MiB
-filesystem_size = 650
+# Filesystem size in MiB (desktop default is 650; the browsers need the rest)
+filesystem_size = 2048
+
+[packages]
+# Browsers beyond the desktop's NetSurf. Both are upstream work-in-progress recipes;
+# upstream marks firefox "compiled, need testing".
+firefox = {}
+webkitgtk3 = {}
+# Built locally so it picks up branding/ui (see recipes/gui/orbdata/recipe.toml).
+orbdata = "source"
 
 [[files]]
 path = "/etc/hostname"
