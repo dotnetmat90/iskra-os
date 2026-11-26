@@ -4,7 +4,7 @@ Iskra is an experimental operating system based on [Redox OS](https://www.redox-
 
 The goal is an OS where AI agents run inside capability sandboxes enforced by the microkernel: an agent sees only the files and services it was granted, and asks before reaching for more.
 
-Status: early. Today Iskra is the upstream desktop image with its own identity (`config/iskra.toml`). See `PATCHES.md` for every change to upstream files.
+Status: early. Today Iskra is the upstream desktop image with its own identity (`config/iskra.toml`): synthwave theme, Firefox and WebKitGTK, and an `ai` command that talks to Claude, OpenAI, Gemini or local models. See `PATCHES.md` for every change to upstream files and `EXPERIMENTS.md` for parked work (XFCE and xfwl4 on Redox).
 
 ## Build and test
 

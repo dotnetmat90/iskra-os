@@ -1,3 +1,4 @@
+# PARKED 2026-11-26, see EXPERIMENTS.md. Starts, but fails in UTM and shows no apps yet.
 # EXPERIMENT: Iskra booting into xfwl4, Xfce's Rust Wayland compositor, running nested inside
 # Orbital through smithay's winit backend (how upstream's wayland.toml runs cosmic-comp).
 # Build: ISKRA_CONFIG=iskra-xfwl4 ./iskra.sh build

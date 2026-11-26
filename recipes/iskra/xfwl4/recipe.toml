@@ -1,8 +1,9 @@
+# PARKED 2026-11-26, see EXPERIMENTS.md.
 # EXPERIMENT: Xfce's Rust Wayland compositor (xfwl4), nested inside Orbital through
 # smithay's winit backend, the same way Redox's cosmic-comp port runs.
 # Needs a smithay with Redox patches at the commit xfwl4 pins: Redox's fork
 # (github.com/jackpot51/smithay, branch redox) rebased onto that commit, checked out at
-# build/iskra-src/smithay (see PLAN.md, "xfwl4 experiment").
+# build/iskra-src/smithay. Run recipes/iskra/xfwl4/prepare.sh first.
 [source]
 git = "https://gitlab.xfce.org/xfce/xfwl4.git"
 shallow_clone = true

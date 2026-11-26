@@ -1,7 +1,7 @@
 # Iskra with the XFCE desktop (X11 running inside Orbital) instead of Orbital's own taskbar.
 # NOT WORKING (tested 2026-11-25): X starts and draws (xterm shows), but xfwm4, xfce4-panel
 # and xfdesktop exit immediately with no output. Kept as a record and for retesting after
-# upstream updates; Iskra's desktop is built natively on Orbital instead (see PLAN.md).
+# upstream updates; Iskra's desktop is built natively on Orbital instead. See EXPERIMENTS.md.
 # Build: ISKRA_CONFIG=iskra-xfce ./iskra.sh build
 
 include = ["iskra.toml", "x11.toml"]
