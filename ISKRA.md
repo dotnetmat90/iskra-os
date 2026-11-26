@@ -18,6 +18,8 @@ Needs a Linux host (x86_64 recommended; arm64 works for building) with `sudo`.
 ./iskra.sh check   # report CPU, KVM and nested-virtualization support
 ```
 
+On a Proxmox server, see `PROXMOX.md`.
+
 `run` and `test` use KVM when the host is x86_64 with `/dev/kvm`, and software emulation otherwise.
 
 To see the desktop from another machine: `ssh -L 5900:127.0.0.1:5900 <server>`, then open `vnc://localhost:5900`.
