@@ -1,5 +1,9 @@
 [source]
 git = "https://gitlab.redox-os.org/redox-os/orbital.git"
+# Iskra: pinned to the commit of the prebuilt package it replaces, plus a patch that hides the
+# pointer until the mouse first moves (clean boot splash).
+rev = "56620bba7dfd2652bd6b4e97909faecfcde2e27d"
+patches = ["../../iskra/orbital/hide-pointer-at-start.patch"]
 
 [build]
 template = "cargo"

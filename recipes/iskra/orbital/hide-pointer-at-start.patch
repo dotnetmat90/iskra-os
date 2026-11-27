@@ -1,0 +1,39 @@
+From 718d17e8617ef5f3dff486c2f50a91d25eed2801 Mon Sep 17 00:00:00 2001
+From: iskra <iskra@localhost>
+Date: Fri, 27 Nov 2026 20:53:59 +0100
+Subject: [PATCH] Hide the pointer until the mouse moves; apply window cursor
+ visibility at once
+
+---
+ src/scheme.rs | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/scheme.rs b/src/scheme.rs
+index c167a0e..a8dcfa9 100644
+--- a/src/scheme.rs
++++ b/src/scheme.rs
+@@ -168,7 +168,8 @@ impl OrbitalScheme {
+             fps_widget: FpsWidget::new(),
+         };
+ 
+-        orbital_scheme.update_cursor(0, 0, CursorKind::LeftPtr);
++        // Iskra: no pointer until the mouse first moves, so the boot splash stays clean.
++        orbital_scheme.update_cursor(0, 0, CursorKind::None);
+ 
+         Ok(orbital_scheme)
+     }
+@@ -312,6 +313,11 @@ impl OrbitalScheme {
+     pub fn handle_window_mouse_cursor(&mut self, id: WindowId, visible: bool) -> Result<()> {
+         let window = self.windows.get_mut(&id).ok_or(Error::new(EBADF))?;
+         window.mouse_cursor = visible;
++        // Iskra: apply it now if the pointer is over this window, not on the next mouse event.
++        if window.rect().contains(self.cursor_x, self.cursor_y) {
++            let kind = if visible { CursorKind::LeftPtr } else { CursorKind::None };
++            self.update_cursor(self.cursor_x, self.cursor_y, kind);
++        }
+         Ok(())
+     }
+ 
+-- 
+2.43.0
+

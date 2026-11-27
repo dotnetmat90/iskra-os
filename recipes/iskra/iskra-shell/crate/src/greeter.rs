@@ -283,6 +283,8 @@ fn greet(cmd: &[String], boot: bool) -> Option<Command> {
     let s = ((h / 1600) + 1) as f32;
     let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
     let sbox = (cx - 26.0 * s, cy - 26.0 * s, 52.0 * s, 52.0 * s);
+    // No pointer over the splash (Orbital applies this on mouse events over the window).
+    win.set_mouse_cursor(false);
     win.set(Color::rgb(0, 0, 0));
     win.sync();
     while !prep.is_finished() || (boot && t0.elapsed().as_secs_f32() < 1.0) {
@@ -302,6 +304,7 @@ fn greet(cmd: &[String], boot: bool) -> Option<Command> {
         spark_box: (0., 0., 0., 0.), pill_box: (0., 0., 0., 0.), hover: -1,
     };
     g.reveal((cx, cy));
+    g.win.set_mouse_cursor(true); // shows again on the next mouse movement
     g.draw();
 
     user_data! { enum Ev { Win, Tick } }

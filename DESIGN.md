@@ -130,7 +130,8 @@ Differences from the design, and why:
   the bootloader: Iskra patches upstream `fbbootlogd` (`recipes/iskra/base/`) to draw the spark on
   black instead of the log (Esc shows the log). The kernel's own first lines still flash by, since
   the kernel's early console has no off switch. The greeter then opens black with the spark and
-  fades the wallpaper in as the spark glides to its place above the clock. The boot console's
-  mouse pointer shows in the top-left corner.
+  fades the wallpaper in as the spark glides to its place above the clock. The pointer stays
+  hidden through the splash and fade-in and returns with the login screen (patched Orbital,
+  `recipes/iskra/orbital/`).
 - **Not started:** desktop widgets, window decorations (Orbital draws title bars;
   only its colours were changed in `branding/share/ui/orbital.toml`).
