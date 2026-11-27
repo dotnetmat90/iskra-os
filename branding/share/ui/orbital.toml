@@ -10,7 +10,7 @@ window_close = "/usr/share/ui/window_close.png"
 window_close_unfocused = "/usr/share/ui/window_close_unfocused.png"
 
 # Iskra palette (DESIGN.md): neutral dark glass, white text. Colours are 0xAARRGGBB.
-background_color = { data = 0xFF0D1326 }      # behind the wallpaper
+background_color = { data = 0xFF000000 }      # black, so the boot splash starts black
 bar_color = { data = 0xD9181B24 }             # title bar, unfocused window
 bar_highlight_color = { data = 0xE6262A36 }   # title bar, focused window
 text_color = { data = 0xFFA9ADB8 }            # title text, unfocused

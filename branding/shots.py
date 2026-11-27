@@ -2,7 +2,7 @@
 """Boot the Iskra image headless with a virtual VGA display, log in through the GUI
 by sending keystrokes, and save screenshots of the login screen and the desktop.
 
-Usage: [ISKRA_CONFIG=iskra] [SHOTS_NO_LOGIN=1 SHOTS_DESKTOP_WAIT=120] branding/shots.py OUTDIR [steps...]
+Usage: [ISKRA_CONFIG=iskra] [SHOTS_NO_LOGIN=1 SHOTS_DESKTOP_WAIT=120] [SHOTS_BOOT=<count>] branding/shots.py OUTDIR [steps...]
 Each extra step is a number (seconds to wait), "key:<qemu sendkey names>"
 (e.g. key:ctrl-t, key:ret), "type:<text>", "mouse:<dx>,<dy>" (relative move),
 "click", or "shot:<name>" to save a screenshot.
@@ -41,9 +41,9 @@ def monitor(cmd):
     p.stdin.write(cmd.encode() + b"\n"); p.stdin.flush(); time.sleep(0.5)
     p.stdin.write(b"\x01c"); p.stdin.flush(); time.sleep(0.3)
 
-def shot(name):
+def shot(name, wait=2):
     path = os.path.join(out, name + ".ppm")
-    monitor(f"screendump {path}"); pump(2)
+    monitor(f"screendump {path}"); pump(wait)
     subprocess.run(["convert", path, path[:-4] + ".png"], check=False)
     print("saved", path[:-4] + ".png", flush=True)
 
@@ -59,6 +59,8 @@ try:
     # With a display attached the bootloader waits for a resolution choice.
     assert pump(300, b"1920x1080"), "no resolution menu"
     pump(2); keys("ret")
+    for n in range(int(os.environ.get("SHOTS_BOOT", "0"))):  # boot timeline, ~1.5 s apart
+        shot(f"0-boot-{n:02d}", 0.2)
     assert pump(900, b"login:"), "no login prompt on serial"
     if os.environ.get("SHOTS_NO_LOGIN"):   # session starts without orblogin (e.g. iskra-xfce)
         pump(float(os.environ.get("SHOTS_DESKTOP_WAIT", "120")))

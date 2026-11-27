@@ -65,9 +65,43 @@ struct Greeter {
 }
 
 impl Greeter {
+    /// Top of the centre stack and the user card's height.
+    fn stack_top(&self) -> (f32, f32) {
+        let (h, s) = (self.win.height() as f32, self.s);
+        let card_h = (20.0 + 54.0 + 12.0 + 20.0 + 14.0 + 36.0 + 20.0 + if self.error { 22.0 } else { 0.0 }) * s;
+        let spark_h = if self.spark == SparkMode::Off { 0.0 } else { 52.0 * s + 14.0 * s };
+        let total = spark_h + 76.0 * s + 8.0 * s + 18.0 * s + 26.0 * s + card_h;
+        (((h - total) / 2.0 - 24.0 * s).max(54.0 * s), card_h)
+    }
+
+    /// End of the splash: the frosted wallpaper fades in behind the spark (~600 ms) while the
+    /// spark glides from the screen centre to its place above the clock.
+    fn reveal(&mut self, from: (f32, f32)) {
+        let to = (from.0, self.stack_top().0 + 26.0 * self.s);
+        let start = Instant::now();
+        loop {
+            let a = (start.elapsed().as_secs_f32() / 0.6).min(1.0);
+            let e = a * a * (3.0 - 2.0 * a); // smoothstep
+            let ia = (e * 256.0) as u32;
+            for (d, f) in self.win.data_mut().iter_mut().zip(self.frosted.data()) {
+                let m = |v: u8| ((v as u32 * ia) >> 8) as u8;
+                *d = Color::rgb(m(f.r()), m(f.g()), m(f.b()));
+            }
+            if self.spark != SparkMode::Off {
+                let (x, y) = (from.0 + (to.0 - from.0) * e, from.1 + (to.1 - from.1) * e);
+                spark(&mut self.win, x, y, 52.0 * self.s, self.t0.elapsed().as_secs_f32(), self.spark == SparkMode::On);
+            }
+            self.win.sync();
+            if a >= 1.0 {
+                break;
+            }
+        }
+    }
+
     fn draw(&mut self) {
         let (w, h, s) = (self.win.width() as f32, self.win.height() as f32, self.s);
         self.win.data_mut().copy_from_slice(self.frosted.data());
+        let (mut y, card_h) = self.stack_top();
         let f = &self.fonts;
         let win = &mut self.win;
 
@@ -88,10 +122,7 @@ impl Greeter {
 
         // 2. Centre stack: spark, time, date, user card.
         let clock = now();
-        let card_h = (20.0 + 54.0 + 12.0 + 20.0 + 14.0 + 36.0 + 20.0 + if self.error { 22.0 } else { 0.0 }) * s;
         let spark_h = if self.spark == SparkMode::Off { 0.0 } else { 52.0 * s + 14.0 * s };
-        let total = spark_h + 76.0 * s + 8.0 * s + 18.0 * s + 26.0 * s + card_h;
-        let mut y = ((h - total) / 2.0 - 24.0 * s).max(m + pill_h);
         let cx = w / 2.0;
         if self.spark != SparkMode::Off {
             self.spark_box = (cx - 26.0 * s, y, 52.0 * s, 52.0 * s);
@@ -236,18 +267,41 @@ fn first_user() -> (String, Option<String>) {
 }
 
 /// Shows the greeter until a login succeeds; returns the session command.
-fn greet(cmd: &[String], fonts: Fonts) -> Option<Command> {
+fn greet(cmd: &[String], boot: bool) -> Option<Command> {
     let (w, h) = orbclient::get_display_size().ok()?;
     let (user, home) = first_user();
-    let wall = wallpaper(&wallpaper_path(home), w, h);
-    let frosted = frost(&wall, 26.0, 0.5);
-    let win = Window::new_flags(0, 0, w, h, "Iskra", &[WindowFlag::Borderless, WindowFlag::Async])?;
+    let mode = spark_mode();
+    let t0 = Instant::now();
+    let mut win = Window::new_flags(0, 0, w, h, "Iskra", &[WindowFlag::Borderless, WindowFlag::Async])?;
+    // Boot splash (DESIGN.md): black with the breathing spark centred while the wallpaper is
+    // loaded and frosted and the fonts are read, in the background.
+    let prep = std::thread::spawn(move || {
+        let wall = wallpaper(&wallpaper_path(home), w, h);
+        let frosted = frost(&wall, 26.0, 0.5);
+        (wall, frosted, Fonts::load())
+    });
+    let s = ((h / 1600) + 1) as f32;
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    let sbox = (cx - 26.0 * s, cy - 26.0 * s, 52.0 * s, 52.0 * s);
+    win.set(Color::rgb(0, 0, 0));
+    win.sync();
+    while !prep.is_finished() || (boot && t0.elapsed().as_secs_f32() < 1.0) {
+        for _ in win.events() {} // keep Orbital's queue drained
+        if mode != SparkMode::Off {
+            win.rect(sbox.0 as i32, sbox.1 as i32, sbox.2 as u32, sbox.3 as u32, Color::rgb(0, 0, 0));
+            spark(&mut win, cx, cy, 52.0 * s, t0.elapsed().as_secs_f32(), mode == SparkMode::On);
+            win.update_rects(&[(sbox.0 as i32, sbox.1 as i32, sbox.2 as u32, sbox.3 as u32)]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(if mode == SparkMode::On { 66 } else { 200 }));
+    }
+    let (wall, frosted, fonts) = prep.join().ok()?;
     let mut g = Greeter {
         win, wall, frosted, fonts, user, password: String::new(), error: false, shake: None,
-        spark: spark_mode(), t0: Instant::now(), s: ((h / 1600) + 1) as f32,
+        spark: mode, t0, s,
         go: (0., 0., 0., 0.), restart: (0., 0., 0., 0.), shutdown: (0., 0., 0., 0.),
         spark_box: (0., 0., 0., 0.), pill_box: (0., 0., 0., 0.), hover: -1,
     };
+    g.reveal((cx, cy));
     g.draw();
 
     user_data! { enum Ev { Win, Tick } }
@@ -328,8 +382,11 @@ fn main() {
         eprintln!("usage: iskra-greeter <session command> [args...]");
         std::process::exit(2);
     }
+    let mut boot = true;
     loop {
-        let Some(mut command) = greet(&cmd, Fonts::load()) else {
+        let shown = greet(&cmd, boot);
+        boot = false;
+        let Some(mut command) = shown else {
             eprintln!("iskra-greeter: greeter failed; retrying");
             std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
