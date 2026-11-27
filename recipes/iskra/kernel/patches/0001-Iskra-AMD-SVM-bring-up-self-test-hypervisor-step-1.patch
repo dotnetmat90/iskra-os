@@ -1,0 +1,281 @@
+From af1f60c53b15d41cb54203c1334802e3da303c79 Mon Sep 17 00:00:00 2001
+From: mattryznar <ryznarmat@gmail.com>
+Date: Fri, 27 Nov 2026 17:05:52 +0100
+Subject: [PATCH] Iskra: AMD SVM bring-up self-test (hypervisor step 1)
+
+At boot on the BSP, enable SVM, run a real-mode guest (mov ax,0x1234; hlt)
+with VMRUN and check for a HLT exit with AX=0x1234. Behind the
+iskra_svm_selftest feature (on by default in this patched kernel only).
+---
+ Cargo.toml                   |   3 +
+ src/arch/x86_shared/mod.rs   |   4 +
+ src/arch/x86_shared/start.rs |   4 +
+ src/arch/x86_shared/svm.rs   | 205 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 216 insertions(+)
+ create mode 100644 src/arch/x86_shared/svm.rs
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 8f2c6abd..2d5d919c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -89,6 +89,8 @@ default = [
+     "serial_debug",
+     "self_modifying",
+     "x86_kvm_pv",
++    # Iskra: SVM bring-up self-test at boot (iskra-hv development images only)
++    "iskra_svm_selftest",
+     #"busy_panic",
+     #"drop_panic",
+     #"syscall_debug",
+@@ -108,6 +110,7 @@ qemu_debug = []
+ serial_debug = []
+ system76_ec_debug = []
+ x86_kvm_pv = []
++iskra_svm_selftest = []
+ 
+ debugger = ["syscall_debug"]
+ syscall_debug = []
+diff --git a/src/arch/x86_shared/mod.rs b/src/arch/x86_shared/mod.rs
+index 19503518..efe5cca8 100644
+--- a/src/arch/x86_shared/mod.rs
++++ b/src/arch/x86_shared/mod.rs
+@@ -25,6 +25,10 @@ pub mod paging;
+ /// Initialization and start function
+ pub mod start;
+ 
++/// Iskra: AMD SVM bring-up self-test (hypervisor step 1)
++#[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++pub mod svm;
++
+ /// Stop function
+ pub mod stop;
+ 
+diff --git a/src/arch/x86_shared/start.rs b/src/arch/x86_shared/start.rs
+index 7d41f247..7c8203b5 100644
+--- a/src/arch/x86_shared/start.rs
++++ b/src/arch/x86_shared/start.rs
+@@ -226,6 +226,10 @@ fn continue_after_kmain_stack(
+             // Initialize all of the non-core devices not otherwise needed to complete initialization
+             device::init_noncore();
+ 
++            // Iskra: hypervisor step 1, run a tiny SVM guest once at boot.
++            #[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++            crate::arch::x86_shared::svm::selftest();
++
+             args.bootstrap()
+         };
+ 
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+new file mode 100644
+index 00000000..751ab590
+--- /dev/null
++++ b/src/arch/x86_shared/svm.rs
+@@ -0,0 +1,205 @@
++//! Iskra: AMD SVM (AMD-V) bring-up self-test.
++//!
++//! Step 1 of Iskra's hypervisor work (ROADMAP.md, Phase 3). At boot, on the bootstrap CPU only,
++//! enable SVM, build one VMCB for a tiny real-mode guest that runs `mov ax, 0x1234; hlt`, enter it
++//! with VMRUN, and check that it comes back with a HLT exit and AX = 0x1234. This proves the core
++//! path (EFER.SVME, host save area, VMCB layout, VMRUN, #VMEXIT) before any scheme or VMM exists.
++//!
++//! No nested paging yet: with guest paging off and NPT off, guest-physical equals host-physical,
++//! so the guest's code page is just a host frame. VMCB offsets follow FreeBSD's
++//! sys/amd64/vmm/amd/vmcb.h (bhyve, BSD-2-Clause) and the AMD APM vol. 2, appendix B.
++//!
++//! ponytail: three frames are leaked (VMCB, host save area, guest code) and SVM stays enabled in
++//! EFER after the test; fine for a one-shot boot self-test, replace with a real vCPU lifecycle
++//! once there is a /scheme/vmm.
++
++use core::arch::{asm, x86_64::__cpuid};
++
++use crate::memory::{RmmA, RmmArch, allocate_frame};
++
++const MSR_EFER: u32 = 0xC000_0080;
++const MSR_VM_CR: u32 = 0xC001_0114;
++const MSR_VM_HSAVE_PA: u32 = 0xC001_0117;
++const EFER_SVME: u64 = 1 << 12;
++const VM_CR_SVMDIS: u64 = 1 << 4;
++
++// VMCB control area.
++const CTRL_EXC_INTERCEPT: usize = 0x008;
++const CTRL_INST1_INTERCEPT: usize = 0x00C;
++const CTRL_INST2_INTERCEPT: usize = 0x010;
++const CTRL_ASID: usize = 0x058;
++const CTRL_TLB_CTRL: usize = 0x05C;
++const CTRL_EXITCODE: usize = 0x070;
++const CTRL_EXITINFO1: usize = 0x078;
++const CTRL_EXITINFO2: usize = 0x080;
++const INTCPT_HLT: u32 = 1 << 24;
++const INTCPT_SHUTDOWN: u32 = 1 << 31;
++const INTCPT_VMRUN: u32 = 1 << 0; // architecturally required
++const EXIT_HLT: u64 = 0x78;
++
++// VMCB state save area (0x400 + offset in FreeBSD's struct vmcb_state).
++const STATE: usize = 0x400;
++const SEG_ES: usize = STATE + 0x00;
++const SEG_CS: usize = STATE + 0x10;
++const SEG_SS: usize = STATE + 0x20;
++const SEG_DS: usize = STATE + 0x30;
++const SEG_FS: usize = STATE + 0x40;
++const SEG_GS: usize = STATE + 0x50;
++const SEG_GDTR: usize = STATE + 0x60;
++const SEG_LDTR: usize = STATE + 0x70;
++const SEG_IDTR: usize = STATE + 0x80;
++const SEG_TR: usize = STATE + 0x90;
++const STATE_CPL: usize = STATE + 0xCB;
++const STATE_EFER: usize = STATE + 0xD0;
++const STATE_CR4: usize = STATE + 0x148;
++const STATE_CR3: usize = STATE + 0x150;
++const STATE_CR0: usize = STATE + 0x158;
++const STATE_DR7: usize = STATE + 0x160;
++const STATE_DR6: usize = STATE + 0x168;
++const STATE_RFLAGS: usize = STATE + 0x170;
++const STATE_RIP: usize = STATE + 0x178;
++const STATE_RSP: usize = STATE + 0x1D8;
++const STATE_RAX: usize = STATE + 0x1F8;
++const STATE_G_PAT: usize = STATE + 0x268;
++
++/// Guest: real mode, `mov ax, 0x1234` (B8 34 12) then `hlt` (F4).
++const GUEST_CODE: [u8; 4] = [0xB8, 0x34, 0x12, 0xF4];
++const GUEST_AX: u64 = 0x1234;
++
++struct Vmcb(*mut u8);
++
++impl Vmcb {
++    unsafe fn w16(&self, off: usize, v: u16) {
++        unsafe { self.0.add(off).cast::<u16>().write_unaligned(v) }
++    }
++    unsafe fn w32(&self, off: usize, v: u32) {
++        unsafe { self.0.add(off).cast::<u32>().write_unaligned(v) }
++    }
++    unsafe fn w64(&self, off: usize, v: u64) {
++        unsafe { self.0.add(off).cast::<u64>().write_unaligned(v) }
++    }
++    unsafe fn r64(&self, off: usize) -> u64 {
++        unsafe { self.0.add(off).cast::<u64>().read_unaligned() }
++    }
++    /// Segment register in VMCB format: selector, 12-bit attributes, limit, base.
++    unsafe fn seg(&self, off: usize, selector: u16, attrib: u16, limit: u32, base: u64) {
++        unsafe {
++            self.w16(off, selector);
++            self.w16(off + 2, attrib);
++            self.w32(off + 4, limit);
++            self.w64(off + 8, base);
++        }
++    }
++}
++
++fn svm_supported() -> Result<(), &'static str> {
++    let max_ext = __cpuid(0x8000_0000).eax;
++    if max_ext < 0x8000_0001 || __cpuid(0x8000_0001).ecx & (1 << 2) == 0 {
++        return Err("CPU has no SVM (CPUID 8000_0001h ECX bit 2)");
++    }
++    if unsafe { x86::msr::rdmsr(MSR_VM_CR) } & VM_CR_SVMDIS != 0 {
++        return Err("SVM disabled by firmware (VM_CR.SVMDIS)");
++    }
++    Ok(())
++}
++
++/// Allocate a zeroed frame; return its physical address and kernel-virtual pointer.
++fn zeroed_page() -> Option<(u64, *mut u8)> {
++    let frame = allocate_frame(true)?;
++    let phys = frame.base();
++    let virt = RmmA::phys_to_virt(phys).data() as *mut u8;
++    Some((phys.data() as u64, virt))
++}
++
++pub fn selftest() {
++    if let Err(why) = svm_supported() {
++        info!("iskra-svm: skipped: {}", why);
++        return;
++    }
++    if let Err(why) = run_guest() {
++        error!("iskra-svm: FAIL: {}", why);
++    }
++}
++
++fn run_guest() -> Result<(), &'static str> {
++    let (hsave_pa, _) = zeroed_page().ok_or("no frame for host save area")?;
++    let (vmcb_pa, vmcb_va) = zeroed_page().ok_or("no frame for VMCB")?;
++    let (code_pa, code_va) = zeroed_page().ok_or("no frame for guest code")?;
++
++    unsafe {
++        core::ptr::copy_nonoverlapping(GUEST_CODE.as_ptr(), code_va, GUEST_CODE.len());
++
++        let efer = x86::msr::rdmsr(MSR_EFER);
++        x86::msr::wrmsr(MSR_EFER, efer | EFER_SVME);
++        x86::msr::wrmsr(MSR_VM_HSAVE_PA, hsave_pa);
++
++        let v = Vmcb(vmcb_va);
++        // Control: exit on every exception, on HLT and on shutdown (triple fault).
++        v.w32(CTRL_EXC_INTERCEPT, 0xFFFF_FFFF);
++        v.w32(CTRL_INST1_INTERCEPT, INTCPT_HLT | INTCPT_SHUTDOWN);
++        v.w32(CTRL_INST2_INTERCEPT, INTCPT_VMRUN);
++        v.w32(CTRL_ASID, 1);
++        v.w32(CTRL_TLB_CTRL, 1); // flush entire TLB on this VMRUN
++
++        // Guest state: real mode, CS based at the code frame so CS:IP 0:0 is its first byte.
++        const CODE: u16 = 0x009B; // present, S, type 0xB (execute/read, accessed)
++        const DATA: u16 = 0x0093; // present, S, type 0x3 (read/write, accessed)
++        v.seg(SEG_CS, 0, CODE, 0xFFFF, code_pa);
++        for off in [SEG_ES, SEG_SS, SEG_DS, SEG_FS, SEG_GS] {
++            v.seg(off, 0, DATA, 0xFFFF, 0);
++        }
++        v.seg(SEG_GDTR, 0, 0, 0xFFFF, 0);
++        v.seg(SEG_IDTR, 0, 0, 0xFFFF, 0);
++        v.seg(SEG_LDTR, 0, 0x0082, 0xFFFF, 0); // present, LDT
++        v.seg(SEG_TR, 0, 0x008B, 0xFFFF, 0); // present, busy TSS
++        *v.0.add(STATE_CPL) = 0;
++        v.w64(STATE_EFER, EFER_SVME); // VMRUN requires guest EFER.SVME
++        v.w64(STATE_CR0, 0x10); // ET; protection and paging off
++        v.w64(STATE_CR3, 0);
++        v.w64(STATE_CR4, 0);
++        v.w64(STATE_DR6, 0xFFFF_0FF0);
++        v.w64(STATE_DR7, 0x400);
++        v.w64(STATE_RFLAGS, 0x2);
++        v.w64(STATE_RIP, 0);
++        v.w64(STATE_RSP, 0);
++        v.w64(STATE_RAX, 0);
++        v.w64(STATE_G_PAT, 0x0007_0406_0007_0406);
++
++        info!(
++            "iskra-svm: VMRUN real-mode guest (vmcb {:#x}, code {:#x})",
++            vmcb_pa, code_pa
++        );
++        // GIF cleared around VMRUN so no host interrupt lands mid-switch. The guest shares the
++        // host's general registers except RAX/RSP (saved by VMRUN); it only writes AX, so the
++        // others are marked clobbered as a precaution.
++        asm!(
++            "clgi",
++            "vmrun rax",
++            "stgi",
++            inout("rax") vmcb_pa => _,
++            out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
++            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
++            out("r12") _, out("r13") _, out("r14") _, out("r15") _,
++        );
++
++        let exitcode = v.r64(CTRL_EXITCODE);
++        let rip = v.r64(STATE_RIP);
++        let ax = v.r64(STATE_RAX) & 0xFFFF;
++        info!(
++            "iskra-svm: #VMEXIT code {:#x} info1 {:#x} info2 {:#x}, guest rip {:#x} ax {:#x}",
++            exitcode,
++            v.r64(CTRL_EXITINFO1),
++            v.r64(CTRL_EXITINFO2),
++            rip,
++            ax
++        );
++        if exitcode == EXIT_HLT && ax == GUEST_AX {
++            info!("iskra-svm: PASS: guest ran and exited on HLT");
++            Ok(())
++        } else if exitcode == u64::MAX {
++            Err("VMRUN rejected the VMCB (VMEXIT_INVALID): guest state failed a consistency check")
++        } else {
++            Err("unexpected exit")
++        }
++    }
++}
+-- 
+2.43.0
+

@@ -1,6 +1,6 @@
 # Iskra roadmap
 
-Revised 2026-11-27 after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
+Revised 2026-11-27 (hypervisor step 1 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
 The blueprint's vision stays: an OS built for AI agents, where the microkernel decides what an agent
 can see. Its 12-week schedule does not: it packs years of systems work (a hypervisor, IOMMU passthrough,
 a Linux driver VM, GPU gaming, power management) into weeks 5–12. This roadmap keeps the ambition but
@@ -79,6 +79,14 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
 2. AMD SVM first (the Vivobook is AMD; SVM is simpler than VT-x). Develop under nested KVM on Proxmox.
 3. Milestones: a guest executes `hlt` → nested paging → serial output from a tiny guest → a `/scheme/vmm`
    interface → a minimal Linux guest with virtio console and block.
+   - [x] **Step 1 done (2026-11-27):** the kernel enables SVM at boot, runs a real-mode guest
+     (`mov ax, 0x1234; hlt`) with VMRUN and gets a HLT exit with AX = 0x1234; boot then continues
+     normally. Verified in QEMU's SVM emulation (`ISKRA_CONFIG=iskra-hv ISKRA_QEMU_CPU=EPYC
+     ISKRA_BOOT_MARKER="iskra-svm: PASS" ./iskra.sh test`). Code: `recipes/iskra/kernel/`.
+   - [ ] Step 2: nested paging (NPT): guest-physical memory separate from host memory.
+   - [ ] Step 3: I/O exits: the guest writes to a serial port and the host prints it.
+   - [ ] Step 4: `/scheme/vmm` so userspace creates VMs, maps memory and runs vCPUs.
+   - [ ] Not yet tried on real AMD hardware or under nested KVM on Proxmox.
 4. Only after that: `dev-bridge` (.NET/Node/Docker ports over virtio-vsock), and a Linux "driver VM".
 
 ## Parked (not on the roadmap until Phase 3 works)

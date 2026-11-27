@@ -15,7 +15,9 @@ BOOT_TIMEOUT=${ISKRA_BOOT_TIMEOUT:-600}
 # Extra flags ride in through the QEMU variable because upstream builds QEMUFLAGS itself.
 qemu() {
   local extra=$1; shift
-  make qemu ARCH=$ARCH CONFIG_NAME=$CONFIG QEMU="qemu-system-$ARCH $extra" "$@"
+  # ISKRA_QEMU_CPU picks the CPU model, e.g. EPYC to emulate AMD SVM for the hypervisor self-test.
+  make qemu ARCH=$ARCH CONFIG_NAME=$CONFIG QEMU="qemu-system-$ARCH $extra" \
+    ${ISKRA_QEMU_CPU:+QEMU_CPU=$ISKRA_QEMU_CPU} "$@"
 }
 
 case "${1:-}" in
