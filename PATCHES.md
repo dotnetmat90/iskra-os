@@ -9,7 +9,7 @@ Every upstream file Iskra modifies is listed here, with the reason. New Iskra-on
 | `recipes/wip/x11/xfce4/xfconf/recipe.toml` | 4.21.0 → 4.21.2 | xfwl4 needs xfconf ≥ 4.21.2. Its meson build has a race on a generated D-Bus header; a retry passes. |
 | `recipes/wip/x11/xfce4/libxfce4ui/recipe.toml` (+ `xdt-gen-visibility` next to it) | 4.21.2 → 4.21.4; custom script that puts the bundled `xdt-gen-visibility` helper on `PATH` | xfwl4 needs the 4.21.4 keyboard-shortcut API. The 4.21.4 tarball does not bundle that helper; the copy comes from xfconf 4.21.2. |
 
-Patches to code outside this repository (kept in `recipes/iskra/xfwl4/patches/`, applied by `recipes/iskra/xfwl4/prepare.sh`):
+Patches to code outside this repository (kept in `recipes/iskra/<name>/patches/`, applied by that folder's `prepare.sh`):
 
 | Project | Change | Why |
 |---|---|---|
