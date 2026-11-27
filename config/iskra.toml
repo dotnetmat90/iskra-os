@@ -18,6 +18,8 @@ orbdata = "source"
 iskra-tools = "source"
 # Iskra's GUI (DESIGN.md): Inter font, greeter, panel and command bar.
 font-inter = "source"
+# Built from source for the boot splash patch in fbbootlogd (recipes/iskra/base/).
+base = "source"
 iskra-shell = "source"
 
 # Start Orbital with Iskra's greeter and panel instead of orblogin and launcher

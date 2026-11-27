@@ -61,6 +61,8 @@ try:
     pump(2); keys("ret")
     for n in range(int(os.environ.get("SHOTS_BOOT", "0"))):  # boot timeline, ~1.5 s apart
         shot(f"0-boot-{n:02d}", 0.2)
+        if n == 0 and os.environ.get("SHOTS_BOOT_KEY"):  # e.g. esc: show the boot log
+            keys(os.environ["SHOTS_BOOT_KEY"])
     assert pump(900, b"login:"), "no login prompt on serial"
     if os.environ.get("SHOTS_NO_LOGIN"):   # session starts without orblogin (e.g. iskra-xfce)
         pump(float(os.environ.get("SHOTS_DESKTOP_WAIT", "120")))

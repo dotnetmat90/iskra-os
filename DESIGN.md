@@ -126,10 +126,11 @@ Differences from the design, and why:
 - **Command bar:** Recent, Apps, Files (two levels of `$HOME`), Actions (Log out, Restart, Shut
   down) and Ask AI. Ask AI opens a terminal running `ai "<question>"` instead of streaming into the
   panel; no permission prompts (no agent runtime yet); no "hold Space to speak".
-- **Boot splash starts at Orbital, not at the bootloader handoff.** The greeter opens black with
-  the breathing spark centred while it prepares, then fades the wallpaper in as the spark glides to
-  its place above the clock. The first seconds of boot (kernel messages, then the boot log drawn by
-  upstream `fbbootlogd` in the `base` package) still show text; replacing that means patching
-  `fbbootlogd` (its source already suggests a splash there) and the kernel's early console.
+- **Boot splash** starts when userspace's boot-log daemon takes the screen, about a second after
+  the bootloader: Iskra patches upstream `fbbootlogd` (`recipes/iskra/base/`) to draw the spark on
+  black instead of the log (Esc shows the log). The kernel's own first lines still flash by, since
+  the kernel's early console has no off switch. The greeter then opens black with the spark and
+  fades the wallpaper in as the spark glides to its place above the clock. The boot console's
+  mouse pointer shows in the top-left corner.
 - **Not started:** desktop widgets, window decorations (Orbital draws title bars;
   only its colours were changed in `branding/share/ui/orbital.toml`).

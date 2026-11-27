@@ -1,0 +1,291 @@
+From 4e74fda54ab28325f207aa88e816df349c6b9ea2 Mon Sep 17 00:00:00 2001
+From: iskra <iskra@localhost>
+Date: Fri, 27 Nov 2026 19:56:48 +0100
+Subject: [PATCH] fbbootlogd: Iskra boot splash (spark on black, Esc shows the
+ log)
+
+---
+ drivers/graphics/console-draw/src/lib.rs  | 15 ++++
+ drivers/graphics/fbbootlogd/src/main.rs   | 79 +++++++++++++++++++
+ drivers/graphics/fbbootlogd/src/splash.rs | 92 +++++++++++++++++++++++
+ 3 files changed, 186 insertions(+)
+ create mode 100644 drivers/graphics/fbbootlogd/src/splash.rs
+
+diff --git a/drivers/graphics/console-draw/src/lib.rs b/drivers/graphics/console-draw/src/lib.rs
+index 8e58e8d3..e4a2f215 100644
+--- a/drivers/graphics/console-draw/src/lib.rs
++++ b/drivers/graphics/console-draw/src/lib.rs
+@@ -176,6 +176,21 @@ impl V2DisplayMap {
+         damage
+     }
+ 
++    /// Draws straight into the primary framebuffer (ARGB8888, mirrored to the other displays) and
++    /// presents the damage rectangle `f` returns as (x1, y1, x2, y2). Used by fbbootlogd's splash.
++    pub fn draw_raw(
++        &mut self,
++        f: impl FnOnce(&mut [u32], usize, usize, usize) -> (u16, u16, u16, u16),
++    ) -> io::Result<()> {
++        let damage = self.with_console_map(|map| {
++            // SAFETY: the shadow buffer outlives this call and nothing else borrows it meanwhile.
++            let buf = unsafe { &mut *map.offscreen };
++            let (x1, y1, x2, y2) = f(buf, map.stride, map.width, map.height);
++            ClipRect::new(x1, y1, x2, y2)
++        });
++        self.dirty_fb(damage)
++    }
++
+     fn dirty_fb(&mut self, damage: ClipRect) -> io::Result<()> {
+         for (_crtc, fb, buffer) in &mut self.displays {
+             buffer.sync_rect(
+diff --git a/drivers/graphics/fbbootlogd/src/main.rs b/drivers/graphics/fbbootlogd/src/main.rs
+index 8c1bc9a1..abba9ff3 100644
+--- a/drivers/graphics/fbbootlogd/src/main.rs
++++ b/drivers/graphics/fbbootlogd/src/main.rs
+@@ -5,7 +5,10 @@
+ 
+ use std::collections::VecDeque;
+ use std::io::{self, Read};
++use std::fs::File;
++use std::io::Write;
+ use std::os::fd::{AsRawFd, IntoRawFd};
++use std::time::Instant;
+ 
+ use console_draw::alacritty_terminal::grid::Scroll;
+ use console_draw::alacritty_terminal::term;
+@@ -15,11 +18,14 @@ use graphics_ipc::DrmHandle;
+ use inputd::{ConsumerHandle, ConsumerHandleEvent};
+ use orbclient::{Event, EventOption};
+ 
++mod splash;
++
+ event::user_data! {
+     enum Source {
+         LogPipe,
+         Input,
+         DisplayHandle,
++        Timer,
+     }
+ }
+ 
+@@ -74,6 +80,14 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+             .expect("fbbootlogd: failed to send log fd to log scheme.");
+     }
+ 
++    // Iskra: animation timer for the boot splash (opened before entering the null namespace).
++    let mut timer = File::open(format!("/scheme/time/{}", libredox::flag::CLOCK_MONOTONIC))
++        .expect("fbbootlogd: failed to open timer");
++    event_queue
++        .subscribe(timer.as_raw_fd() as usize, Source::Timer, event::EventFlags::READ)
++        .expect("fbbootlogd: failed to subscribe to timer");
++    arm(&mut timer, 66);
++
+     let _ = daemon.ready();
+ 
+     libredox::call::setns(0).expect("fbbootlogd: failed to enter null namespace");
+@@ -112,16 +126,43 @@ fn daemon(daemon: daemon::Daemon) -> ! {
+             Source::DisplayHandle => {
+                 bootlog.handle_display_event();
+             }
++            Source::Timer => {
++                let mut buf = [0u8; 16];
++                let _ = timer.read(&mut buf);
++                if bootlog.tick() {
++                    arm(&mut timer, 66);
++                }
++            }
+         }
+     }
+ 
+     std::process::exit(0);
+ }
+ 
++/// Asks the monotonic timer for one wake-up `ms` from now.
++fn arm(timer: &mut File, ms: u64) {
++    let mut buf = [0u8; 16]; // TimeSpec: i64 seconds, i32 nanoseconds, padding
++    if timer.read(&mut buf).unwrap_or(0) < 12 {
++        return;
++    }
++    let sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
++    let ns = i32::from_ne_bytes(buf[8..12].try_into().unwrap()) as u64 + ms * 1_000_000;
++    buf[0..8].copy_from_slice(&(sec + (ns / 1_000_000_000) as i64).to_ne_bytes());
++    buf[8..12].copy_from_slice(&((ns % 1_000_000_000) as i32).to_ne_bytes());
++    let _ = timer.write(&buf);
++}
++
++/// Iskra: the spark animates for this long at most, so it never runs on behind the desktop.
++const SPLASH_ANIMATE_SECS: f32 = 60.0;
++
+ struct Fbbootlog {
+     display_map: Option<V2DisplayMap>,
+     text_screen: TextScreen,
+     shift: bool,
++    /// Iskra boot splash; `None` once Esc switched to the boot log.
++    splash: Option<Instant>,
++    /// Boot log kept while the splash shows, replayed on Esc.
++    log: Vec<u8>,
+ }
+ 
+ impl Fbbootlog {
+@@ -133,6 +174,8 @@ impl Fbbootlog {
+             display_map: None,
+             text_screen: TextScreen::new(None, config),
+             shift: false,
++            splash: Some(Instant::now()),
++            log: Vec::new(),
+         }
+     }
+ 
+@@ -169,9 +212,38 @@ impl Fbbootlog {
+         };
+ 
+         eprintln!("fbbootlogd: mapped display");
++        if let (Some(t0), Some(map)) = (self.splash, &mut self.display_map) {
++            let t = t0.elapsed().as_secs_f32();
++            let _ = map.draw_raw(|b, st, w, h| splash::full(b, st, w, h, t, true));
++        }
++    }
++
++    /// Draws a splash frame; returns whether the timer should fire again.
++    fn tick(&mut self) -> bool {
++        let (Some(t0), Some(map)) = (self.splash, &mut self.display_map) else {
++            return self.splash.is_some(); // splash on, but no display yet
++        };
++        let t = t0.elapsed().as_secs_f32();
++        let moving = t < SPLASH_ANIMATE_SECS;
++        let _ = map.draw_raw(|b, st, w, h| splash::frame(b, st, w, h, if moving { t } else { 0.0 }, moving));
++        moving
+     }
+ 
+     fn handle_input(&mut self, ev: &Event) {
++        if self.splash.is_some() {
++            // Esc during the splash shows the boot log so far, and from then on.
++            if let EventOption::Key(k) = ev.to_option() {
++                if k.pressed && k.scancode == 0x01 {
++                    self.splash = None;
++                    if let Some(map) = &mut self.display_map {
++                        self.text_screen.handle_handoff(map);
++                        self.text_screen.write(map, &self.log, &mut VecDeque::new());
++                    }
++                    self.log = Vec::new();
++                }
++            }
++            return;
++        }
+         match ev.to_option() {
+             EventOption::Key(key_event) => {
+                 if key_event.scancode == 0x2A || key_event.scancode == 0x36 {
+@@ -227,6 +299,13 @@ impl Fbbootlog {
+     }
+ 
+     fn handle_logs(&mut self, buf: &[u8]) {
++        if self.splash.is_some() {
++            if self.log.len() > 1 << 20 {
++                self.log.drain(..1 << 19); // ponytail: keep the newest ~1 MiB of boot log
++            }
++            self.log.extend_from_slice(buf);
++            return;
++        }
+         if let Some(map) = &mut self.display_map {
+             self.text_screen.write(map, buf, &mut VecDeque::new());
+         }
+diff --git a/drivers/graphics/fbbootlogd/src/splash.rs b/drivers/graphics/fbbootlogd/src/splash.rs
+new file mode 100644
+index 00000000..45fae67e
+--- /dev/null
++++ b/drivers/graphics/fbbootlogd/src/splash.rs
+@@ -0,0 +1,92 @@
++//! Iskra boot splash: a black screen with the breathing spark centred, drawn instead of the boot
++//! log. The log is kept and shown when Esc is pressed. Same spark as Iskra's greeter
++//! (recipes/iskra/iskra-shell/crate/src/lib.rs); ponytail: copied rather than shared, so the
++//! early-boot daemon gains no dependencies.
++
++use std::f32::consts::TAU;
++
++const BLACK: u32 = 0xFF00_0000;
++
++fn blend(d: &mut u32, rgb: (f32, f32, f32), a: f32) {
++    let ch = |shift: u32, s: f32| {
++        let v = ((*d >> shift) & 0xFF) as f32;
++        ((v + (s - v) * a).clamp(0.0, 255.0) as u32) << shift
++    };
++    *d = 0xFF00_0000 | ch(16, rgb.0) | ch(8, rgb.1) | ch(0, rgb.2);
++}
++
++struct Canvas<'a> {
++    buf: &'a mut [u32],
++    stride: usize,
++    w: usize,
++    h: usize,
++}
++
++impl Canvas<'_> {
++    /// Fills a box using a signed distance function; coverage = 0.5 - distance.
++    fn fill(&mut self, (x0, y0, x1, y1): (f32, f32, f32, f32), color: impl Fn(f32, f32) -> ((f32, f32, f32), f32), sd: impl Fn(f32, f32) -> f32) {
++        let ys = (y0.floor().max(0.0) as usize)..(y1.ceil().max(0.0) as usize).min(self.h);
++        for y in ys {
++            for x in (x0.floor().max(0.0) as usize)..(x1.ceil().max(0.0) as usize).min(self.w) {
++                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
++                let cov = (0.5 - sd(px, py)).clamp(0.0, 1.0);
++                if cov > 0.0 {
++                    let (rgb, a) = color(px, py);
++                    blend(&mut self.buf[y * self.stride + x], rgb, a * cov);
++                }
++            }
++        }
++    }
++
++    fn circle(&mut self, cx: f32, cy: f32, r: f32, a: f32) {
++        self.fill((cx - r - 1.0, cy - r - 1.0, cx + r + 1.0, cy + r + 1.0), |_, _| ((255.0, 255.0, 255.0), a), |px, py| (px - cx).hypot(py - cy) - r);
++    }
++
++    fn star(&mut self, cx: f32, cy: f32, r: f32, a: f32) {
++        self.fill((cx - r, cy - r, cx + r, cy + r), |_, _| ((255.0, 255.0, 255.0), a), |px, py| {
++            let (dx, dy) = (((px - cx) / r).abs(), ((py - cy) / r).abs());
++            ((dx.powf(0.55) + dy.powf(0.55)).powf(1.0 / 0.55) - 1.0) * r * 0.45
++        });
++    }
++}
++
++/// Clears the whole screen to black and draws the spark. Returns the damage rectangle.
++pub fn full(buf: &mut [u32], stride: usize, w: usize, h: usize, t: f32, particles: bool) -> (u16, u16, u16, u16) {
++    for y in 0..h {
++        buf[y * stride..y * stride + w].fill(BLACK);
++    }
++    frame(buf, stride, w, h, t, particles);
++    (0, 0, w as u16, h as u16)
++}
++
++/// Redraws the spark's box only. Returns the damage rectangle.
++pub fn frame(buf: &mut [u32], stride: usize, w: usize, h: usize, t: f32, particles: bool) -> (u16, u16, u16, u16) {
++    let s = ((h / 1600) + 1) as f32;
++    let size = 52.0 * s;
++    let (cx, cy) = ((w / 2) as f32, (h / 2) as f32);
++    let (x0, y0) = ((cx - size / 2.0).max(0.0) as usize, (cy - size / 2.0).max(0.0) as usize);
++    let (x1, y1) = (((cx + size / 2.0) as usize).min(w), ((cy + size / 2.0) as usize).min(h));
++    for y in y0..y1 {
++        buf[y * stride + x0..y * stride + x1].fill(BLACK);
++    }
++    let mut c = Canvas { buf, stride, w, h };
++    let breathe = 0.5 - 0.5 * (t * TAU / 4.0).cos(); // 0..1, 4 s period
++    let halo = (10.0 + 4.0 * breathe) * s * 1.9;
++    c.fill((cx - halo, cy - halo, cx + halo, cy + halo), |px, py| {
++        let d = (px - cx).hypot(py - cy) / halo;
++        ((150.0, 200.0, 255.0), (1.0 - d).max(0.0).powi(2) * (70.0 + 40.0 * breathe) / 255.0)
++    }, |px, py| (px - cx).hypot(py - cy) - halo);
++    c.star(cx, cy, (8.0 + 3.0 * breathe) * s, 0.92);
++    c.circle(cx, cy, (2.2 + 0.6 * breathe) * s, 1.0);
++    if particles {
++        for i in 0..12 {
++            let fi = i as f32;
++            let orbit = (11.0 + (fi * 7.3) % 12.0) * s;
++            let speed = 0.25 + (fi * 0.37) % 0.3;
++            let a = fi * 2.399 + t * speed * if i % 2 == 0 { 1.0 } else { -1.0 };
++            let tw = 0.5 + 0.5 * (t * (1.3 + fi * 0.21) + fi).sin();
++            c.circle(cx + orbit * a.cos(), cy + orbit * a.sin(), (0.7 + 0.5 * tw) * s, 0.25 + 0.6 * tw);
++        }
++    }
++    (x0 as u16, y0 as u16, x1 as u16, y1 as u16)
++}
+-- 
+2.43.0
+

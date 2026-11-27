@@ -3,6 +3,9 @@ description = "Essential system components and drivers for Redox"
 
 [source]
 git = "https://gitlab.redox-os.org/redox-os/base.git"
+# Iskra: pinned to the commit of the prebuilt package it replaces, plus the boot-splash patch.
+rev = "6cf80970594c9d429da114ac7b076e9fc31233d4"
+patches = ["../../iskra/base/fbbootlogd-splash.patch"]
 
 [build]
 template = "custom"
