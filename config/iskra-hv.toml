@@ -5,6 +5,12 @@
 # QEMU emulates AMD SVM for the EPYC model, so this works without virtualization hardware.
 # Inside: `grep iskra-svm /scheme/sys/log` (self-tests), `iskra-vmm-hello`, `iskra-vmm-timer`, `iskra-vmm-long`, `iskra-vmm-linux` as root (userspace VMs; the
 # last boots Linux).
+# PCI passthrough (hypervisor step 8) under QEMU's emulated AMD IOMMU: give QEMU, in front of
+# its own flags, `-device amd-iommu -device virtio-serial-pci,disable-legacy=on,iommu_platform=on,
+# id=vs,addr=0x10 -chardev file,id=hvc,path=/tmp/hvc.out -device virtconsole,chardev=hvc,bus=vs.0`
+# (QEMU's virtio only honors the IOMMU with iommu_platform=on; its pvscsi reads descriptors past
+# the IOMMU), then in Iskra: `iskra-vmm-linux --pass 00:10.0` and in Linux:
+# `echo hi > /dev/hvc0` -> the text lands in /tmp/hvc.out on the QEMU host, via DMA through the IOMMU.
 # See ROADMAP.md, Phase 3.
 
 include = ["iskra.toml"]

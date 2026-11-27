@@ -12,6 +12,10 @@ use std::{
 pub const REGS: u64 = 1 << 48;
 pub const RUN: u64 = REGS + 0x1000;
 pub const INJECT: u64 = REGS + 0x2000;
+pub const ASSIGN: u64 = REGS + 0x3000;
+pub const PORTS: u64 = REGS + 0x4000;
+pub const MMIO: u64 = REGS + 0x5000;
+pub const DEVCFG: u64 = REGS + 0x10000;
 
 // SVM exit codes (AMD APM vol. 2, appendix C).
 pub const EXIT_INTR: u64 = 0x60;
@@ -135,6 +139,35 @@ impl Vm {
     pub fn inject(&self, vector: u8) -> io::Result<()> {
         self.0.write_all_at(&(vector as usize).to_ne_bytes(), INJECT)
     }
+    /// Give host PCI device `bdf` (bus << 8 | dev << 3 | fn) to the guest; its DMA is remapped by
+    /// the IOMMU to guest RAM. Call after guest RAM is populated.
+    pub fn assign(&self, bdf: u16) -> io::Result<()> {
+        self.0.write_all_at(&(bdf as usize).to_ne_bytes(), ASSIGN)
+    }
+    /// Let the guest use the assigned device's I/O BAR `base..base + len` directly.
+    pub fn allow_ports(&self, base: u64, len: u64) -> io::Result<()> {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&base.to_ne_bytes());
+        b[8..].copy_from_slice(&len.to_ne_bytes());
+        self.0.write_all_at(&b, PORTS)
+    }
+    /// Map the assigned device's memory BAR `base..base + len` into the guest at the same address.
+    pub fn map_mmio(&self, base: u64, len: u64) -> io::Result<()> {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&base.to_ne_bytes());
+        b[8..].copy_from_slice(&len.to_ne_bytes());
+        self.0.write_all_at(&b, MMIO)
+    }
+    /// The assigned device's PCI config register `reg` (aligned dword).
+    pub fn dev_cfg(&self, reg: u8) -> io::Result<u32> {
+        let mut b = [0u8; 4];
+        self.0.read_exact_at(&mut b, DEVCFG + (reg & 0xFC) as u64)?;
+        Ok(u32::from_ne_bytes(b))
+    }
+    pub fn set_dev_cfg(&self, reg: u8, v: u32) -> io::Result<()> {
+        self.0.write_all_at(&v.to_ne_bytes(), DEVCFG + (reg & 0xFC) as u64)
+    }
+
     /// Identity-map the first `gib` GiB (1..=512) with 2 MiB pages: PML4 at `at`, PDPT at
     /// `at + 0x1000`, page directories after it. Returns the PML4 address for CR3.
     pub fn identity_map_2m(&self, at: u64, gib: u64) -> io::Result<u64> {

@@ -9,12 +9,21 @@
 //! The default initramfs starts a BusyBox shell on the serial console; type `exit` to power the
 //! VM off. Input can also be piped in, e.g. `printf 'uname -a\nexit\n' | iskra-vmm-linux`.
 //!
+//! `--pass BB:DD.F` gives the guest a host PCI device (hypervisor step 8): the kernel points the
+//! device's DMA at guest RAM through the AMD IOMMU and maps its I/O ports and memory BARs into the
+//! guest at their host addresses; this VMM
+//! shows it to Linux as 00:01.0 behind an emulated host bridge (PCI config mechanism #1, config
+//! reads and writes proxied to the real device, MSI and MSI-X capabilities unlinked so Linux uses
+//! legacy INTx), and
+//! forwards its interrupt line as guest IRQ 5.
+//!
 //! Usage: iskra-vmm-linux [bzImage] [initramfs] [extra kernel arguments...]
 
 use std::{
     arch::x86_64::{__cpuid_count, _rdtsc},
     collections::VecDeque,
-    env, fs,
+    env,
+    fs::{self, File},
     io::{self, Read, Write},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread::{self, sleep},
@@ -42,7 +51,16 @@ const CMDLINE: &str = "console=ttyS0 earlyprintk=serial,ttyS0,115200 rdinit=/ini
 const PIT_HZ: f64 = 1_193_182.0;
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
+    let mut args: Vec<String> = env::args().collect();
+    let pass = match args.iter().position(|a| a == "--pass") {
+        Some(i) if i + 1 < args.len() => {
+            let bdf = parse_bdf(&args[i + 1])
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--pass wants BB:DD.F"))?;
+            args.drain(i..i + 2);
+            Some(bdf)
+        }
+        _ => None,
+    };
     let kernel_path = args.get(1).map(String::as_str).unwrap_or("/usr/share/iskra-vmm/vmlinuz");
     let initrd_path = args.get(2).map(String::as_str).unwrap_or("/usr/share/iskra-vmm/initramfs.cpio");
     let extra = args.get(3..).map(|a| a.join(" ")).unwrap_or_default();
@@ -54,7 +72,9 @@ fn main() -> io::Result<()> {
     let kernel = fs::read(kernel_path)?;
     let initrd = fs::read(initrd_path)?;
     let vm = Vm::new()?;
-    let entry = load_linux(&vm, &kernel, &initrd, &format!("{CMDLINE} {extra}"))?;
+    let cmdline = if pass.is_some() { CMDLINE.replace("pci=off", "pci=conf1,nomsi") } else { CMDLINE.into() };
+    let entry = load_linux(&vm, &kernel, &initrd, &format!("{cmdline} {extra}"))?;
+    let device = pass.map(|bdf| Passthrough::new(&vm, bdf)).transpose()?;
     eprintln!(
         "[iskra-vmm-linux] {} ({} KiB) + initramfs ({} KiB), {} MiB RAM, entry {entry:#x}",
         kernel_path,
@@ -87,10 +107,12 @@ fn main() -> io::Result<()> {
     });
 
     let mut m = Machine::new();
+    m.device = device;
     let start = Instant::now();
     let mut exits: u64 = 0;
     loop {
         m.take_input(&input);
+        m.poll_device()?;
         m.deliver(&vm)?;
         let exit = vm.run()?;
         exits += 1;
@@ -143,7 +165,12 @@ fn main() -> io::Result<()> {
                 r.rip += 1;
                 vm.set_regs(&r)?;
                 if m.next_irq().is_none() {
-                    let wait = m.until_tick().unwrap_or(Duration::from_millis(100));
+                    let mut wait = m.until_tick().unwrap_or(Duration::from_millis(100));
+                    if m.device.is_some() {
+                        // ponytail: the device interrupt is polled, so up to 1 ms latency while
+                        // idle; wait on /scheme/event with both fds if that ever matters.
+                        wait = wait.min(Duration::from_millis(1));
+                    }
                     match input.recv_timeout(wait) {
                         Ok(byte) => m.staged.push_back(byte),
                         Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
@@ -340,6 +367,107 @@ struct Machine {
     serial_line: Vec<u8>,
     ticks: u64,
     absent_pages: u32,
+    /// PCI config address latch (port 0xCF8).
+    pci_addr: u32,
+    device: Option<Passthrough>,
+}
+
+/// Guest IRQ line of the passed-through device (free on the master PIC).
+const DEVICE_IRQ: u8 = 5;
+
+/// A host PCI device given to the guest, shown to it as 00:01.0.
+struct Passthrough {
+    irq: File,
+    /// Capability list as the guest sees it: (offset, next offset), MSI/MSI-X left out.
+    caps: Vec<(u8, u8)>,
+    /// Host interrupt count read but not yet acknowledged (the line stays masked until then).
+    unacked: Option<usize>,
+    pending: bool,
+}
+
+impl Passthrough {
+    fn new(vm: &Vm, bdf: u16) -> io::Result<Self> {
+        vm.assign(bdf)?;
+        let mut i = 0u8;
+        while i < 6 {
+            let reg = 0x10 + 4 * i;
+            let bar = vm.dev_cfg(reg)?;
+            i += 1;
+            if bar & 1 == 0 {
+                // Memory BAR (64-bit ones take the next register too): size it, map it.
+                let wide = bar & 0x6 == 0x4;
+                let hi = if wide { vm.dev_cfg(reg + 4)? } else { 0 };
+                vm.set_dev_cfg(reg, !0)?;
+                let len = (!(vm.dev_cfg(reg)? & !0xF)).wrapping_add(1) as u64;
+                vm.set_dev_cfg(reg, bar)?;
+                if wide {
+                    i += 1;
+                }
+                let base = (hi as u64) << 32 | (bar & !0xF) as u64;
+                if base != 0 && len >= 4096 {
+                    vm.map_mmio(base, len)?;
+                    eprintln!("[iskra-vmm-linux] passthrough: MMIO {base:#x}+{len:#x} mapped into the guest");
+                }
+            } else {
+                // I/O BAR: size it (write all ones, read back the mask, restore), then open it.
+                vm.set_dev_cfg(reg, !0)?;
+                let len = (!(vm.dev_cfg(reg)? & !3) as u64 + 1) & 0xFFFF;
+                vm.set_dev_cfg(reg, bar)?;
+                vm.allow_ports((bar & !3) as u64, len)?;
+                eprintln!("[iskra-vmm-linux] passthrough: I/O ports {:#x}+{len:#x} open to the guest", bar & !3);
+            }
+        }
+        // Walk the capability list and keep everything except MSI (0x05) and MSI-X (0x11).
+        let mut kept = Vec::new();
+        let mut ptr = if vm.dev_cfg(0x04)? & (1 << 20) != 0 { vm.dev_cfg(0x34)? as u8 & 0xFC } else { 0 };
+        for _ in 0..48 {
+            if ptr == 0 {
+                break;
+            }
+            let head = vm.dev_cfg(ptr)?;
+            if !matches!(head & 0xFF, 0x05 | 0x11) {
+                kept.push(ptr);
+            }
+            ptr = (head >> 8) as u8 & 0xFC;
+        }
+        let caps = kept.iter().enumerate().map(|(i, &o)| (o, kept.get(i + 1).copied().unwrap_or(0))).collect();
+        let line = vm.dev_cfg(0x3C)? & 0xFF;
+        let irq = File::open(format!("/scheme/irq/{line}"))?;
+        let id = vm.dev_cfg(0)?;
+        eprintln!(
+            "[iskra-vmm-linux] passthrough: {:02x}:{:02x}.{} ({:04x}:{:04x}) -> guest 00:01.0, host IRQ {line} -> guest IRQ {DEVICE_IRQ}, DMA via IOMMU",
+            bdf >> 8,
+            (bdf >> 3) & 0x1F,
+            bdf & 7,
+            id & 0xFFFF,
+            id >> 16
+        );
+        Ok(Passthrough { irq, caps, unacked: None, pending: false })
+    }
+
+    /// Guest view of config dword `reg` of 00:01.0.
+    fn config(&self, vm: &Vm, reg: u8) -> io::Result<u32> {
+        let v = vm.dev_cfg(reg)?;
+        let first = self.caps.first().map_or(0, |c| c.0);
+        Ok(match reg {
+            0x04 if first == 0 => v & !(1 << 20),            // status: no capability list
+            0x34 => (v & !0xFF) | first as u32,              // capability pointer
+            0x3C => (v & !0xFF) | DEVICE_IRQ as u32,         // interrupt line
+            _ => match self.caps.iter().find(|c| c.0 == reg) {
+                Some(&(_, next)) => (v & !0xFF00) | (next as u32) << 8, // relinked capability
+                None => v,
+            },
+        })
+    }
+}
+
+fn parse_bdf(s: &str) -> Option<u16> {
+    let (bus, rest) = s.split_once(':')?;
+    let (dev, func) = rest.split_once('.')?;
+    let bus = u16::from_str_radix(bus, 16).ok()?;
+    let dev = u16::from_str_radix(dev, 16).ok()?;
+    let func = u16::from_str_radix(func, 16).ok()?;
+    (bus < 256 && dev < 32 && func < 8).then_some(bus << 8 | dev << 3 | func)
 }
 
 impl Machine {
@@ -365,6 +493,8 @@ impl Machine {
             serial_line: Vec::new(),
             ticks: 0,
             absent_pages: 0,
+            pci_addr: 0,
+            device: None,
         }
     }
 
@@ -425,8 +555,77 @@ impl Machine {
             Some(0)
         } else if self.uart_irq().is_some() && self.pic_mask & 0x10 == 0 {
             Some(4)
+        } else if self.device.as_ref().is_some_and(|d| d.pending) && self.pic_mask & (1 << DEVICE_IRQ) == 0 {
+            Some(DEVICE_IRQ)
         } else {
             None
+        }
+    }
+
+    /// Pick up a new host interrupt of the passed-through device.
+    fn poll_device(&mut self) -> io::Result<()> {
+        let Some(d) = self.device.as_mut() else { return Ok(()) };
+        if d.unacked.is_none() {
+            let mut b = [0u8; 8];
+            if (&d.irq).read(&mut b)? == 8 {
+                d.unacked = Some(usize::from_ne_bytes(b));
+                d.pending = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// The guest finished its handler for the device IRQ: unmask the host line again. If the
+    /// device still asserts it (level-triggered), the host sees a new interrupt.
+    fn device_eoi(&mut self) -> io::Result<()> {
+        if let Some(d) = self.device.as_mut() {
+            d.pending = false;
+            if let Some(count) = d.unacked.take() {
+                (&d.irq).write(&count.to_ne_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// PCI config mechanism #1: 0xCF8 address, 0xCFC-0xCFF data. Bus 0 holds a host bridge at
+    /// 00:00.0 (Linux's sanity check wants one) and the passed-through device at 00:01.0.
+    fn pci_config(&mut self, vm: &Vm, port: u16, size: u32, write: Option<u32>) -> io::Result<u32> {
+        if port == 0xCF8 {
+            if size == 4 {
+                match write {
+                    Some(v) => self.pci_addr = v,
+                    None => return Ok(self.pci_addr),
+                }
+            }
+            return Ok(!0);
+        }
+        let a = self.pci_addr;
+        let (enabled, bus, devfn, reg) = (a >> 31 == 1, (a >> 16) & 0xFF, (a >> 8) & 0xFF, (a & 0xFC) as u8);
+        let shift = 8 * (port as u32 - 0xCFC);
+        let mask = if size == 4 { !0u32 } else { ((1u32 << (8 * size)) - 1) << shift };
+        let passed = enabled && bus == 0 && devfn == 0x08 && self.device.is_some();
+        let current = if !enabled || bus != 0 {
+            !0
+        } else if devfn == 0 {
+            match reg {
+                0x00 => 0x29C0_8086, // Intel Q35 host bridge IDs
+                0x08 => 0x0600_0000, // class: host bridge
+                _ => 0,
+            }
+        } else if passed {
+            self.device.as_ref().unwrap().config(vm, reg)?
+        } else {
+            !0
+        };
+        match write {
+            None => Ok((current & mask) >> shift),
+            Some(v) => {
+                if passed && reg != 0x3C {
+                    let raw = vm.dev_cfg(reg)?;
+                    vm.set_dev_cfg(reg, (raw & !mask) | ((v << shift) & mask))?;
+                }
+                Ok(0)
+            }
         }
     }
 
@@ -448,6 +647,21 @@ impl Machine {
         if exit.info1 & (1 << 2) != 0 {
             eprintln!("\n[iskra-vmm-linux] string I/O on port {port:#x} is not supported (rip {:#x})", r.rip);
             std::process::exit(1);
+        }
+        if (0xCF8..=0xCFF).contains(&port) {
+            let mask: u64 = match size {
+                1 => 0xFF,
+                2 => 0xFFFF,
+                _ => 0xFFFF_FFFF,
+            };
+            if is_in {
+                let v = self.pci_config(vm, port, size, None)?;
+                r.gpr[0] = (r.gpr[0] & !mask) | (v as u64 & mask);
+                r.rip = exit.info2;
+                return vm.set_regs(&r);
+            }
+            self.pci_config(vm, port, size, Some((r.gpr[0] & mask) as u32))?;
+            return vm.set_rip(exit.info2);
         }
         let value = r.gpr[0] as u8;
         if is_in {
@@ -544,10 +758,14 @@ impl Machine {
             }
             0x20 if v & 0x18 == 0 && v & 0x20 != 0 => {
                 // OCW2 end of interrupt: specific (bit 6, IRQ in bits 0-2) or the highest in service.
+                let before = self.pic_isr;
                 if v & 0x40 != 0 {
                     self.pic_isr &= !(1 << (v & 7));
                 } else {
                     self.pic_isr &= self.pic_isr.wrapping_sub(1);
+                }
+                if before & !self.pic_isr & (1 << DEVICE_IRQ) != 0 {
+                    self.device_eoi()?;
                 }
             }
             0x20 => {} // other OCW2/OCW3 commands need no state here

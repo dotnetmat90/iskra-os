@@ -123,7 +123,20 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
      initramfs stays as `/usr/share/iskra-vmm/initramfs-hello.cpio`.
    - [ ] Next for Linux: virtio block/network devices, more than one vCPU, a local APIC; or a QEMU accelerator backend
      on `/scheme/sys/vmm` for full device support.
-   - [ ] Later: IOMMU (AMD-Vi) and device passthrough to the Linux VM.
+   - [x] Step 8, PCI device passthrough with the AMD IOMMU: a small AMD-Vi driver in the kernel
+     (IVRS discovery, device table, command buffer; started lazily, every other device stays
+     untranslated) and `/scheme/sys/vmm` operations to assign a device to a VM (DMA remapped to
+     guest RAM by a 4-level I/O page table), open its I/O BARs (I/O permission map) and memory
+     BARs (nested page table, uncached) to the guest, and proxy its PCI config space.
+     `iskra-vmm-linux --pass BB:DD.F` shows the device to Linux as 00:01.0 behind an emulated
+     host bridge (config mechanism #1, MSI/MSI-X capabilities unlinked) and forwards its INTx line
+     as guest IRQ 5. Tested under QEMU (`-device amd-iommu`, virtio-serial with
+     `iommu_platform=on`): Linux's virtio_console drives the real device, its `/dev/hvc0` output
+     reaches the host by DMA through the IOMMU, and its interrupts arrive (6 on IRQ 5). Found on
+     the way: QEMU's AMD-Vi model rejects DTEs whose domain ID has bit 8 set; QEMU's pvscsi and
+     legacy virtio bypass the IOMMU, so they cannot test it.
+   - [ ] Next for passthrough: MSI/MSI-X (needs a guest local APIC and interrupt remapping),
+     PCIe extended config space, more than one device, and a run on real AMD hardware.
    - [ ] Not yet tried on real AMD hardware or under nested KVM on Proxmox.
 4. Only after that: `dev-bridge` (.NET/Node/Docker ports over virtio-vsock), and a Linux "driver VM".
 
