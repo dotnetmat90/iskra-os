@@ -1,7 +1,7 @@
 From 83ad61d08ee5773c7b0616409e2f957211addbe8 Mon Sep 17 00:00:00 2001
 From: mattryznar <ryznarmat@gmail.com>
 Date: Fri, 27 Nov 2026 17:28:57 +0100
-Subject: [PATCH 3/6] Iskra: SVM I/O exit self-test (hypervisor step 3)
+Subject: [PATCH 3/7] Iskra: SVM I/O exit self-test (hypervisor step 3)
 
 The guest prints a string to COM1; every OUT exits to the host through an
 all-ports I/O permission map, the host collects the byte and resumes the guest

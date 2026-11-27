@@ -1,0 +1,46 @@
+From 6712ceafb6e598968271f602a5f6e0e51a21522a Mon Sep 17 00:00:00 2001
+From: mattryznar <ryznarmat@gmail.com>
+Date: Fri, 27 Nov 2026 18:05:18 +0100
+Subject: [PATCH 7/7] Iskra: host interrupts exit running guests (hypervisor
+ step 7)
+
+Set IF inside the CLGI window before VMRUN. With V_INTR_MASKING the host IF at
+VMRUN decides whether physical interrupts are taken during the guest; with it
+clear they stayed masked for the whole run, so a busy guest never exited and
+host timers stalled. Now they cause INTR exits and are serviced right after
+the host state is restored. Found while booting Linux in iskra-vmm-linux.
+---
+ src/arch/x86_shared/svm.rs | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+index 2c6695cb..bd8e92e7 100644
+--- a/src/arch/x86_shared/svm.rs
++++ b/src/arch/x86_shared/svm.rs
+@@ -876,7 +876,11 @@ impl Vm {
+                 "mov r14, [rdi + 8*14]",
+                 "mov r15, [rdi + 8*15]",
+                 "mov rdi, [rdi + 8*7]",
++                // GIF=0 holds every interrupt until VMRUN; setting IF here makes physical
++                // interrupts exit the guest (INTR intercept) instead of staying masked for the
++                // whole run, so host timers and devices keep working while a guest runs.
+                 "clgi",
++                "sti",
+                 "vmrun rax",
+                 "push rdi",              // guest rdi
+                 "mov rdi, [rsp + 8]",    // &gpr
+@@ -912,8 +916,9 @@ impl Vm {
+             );
+             asm!("fxsave64 [{}]", in(reg) self.fpu.0.as_mut_ptr());
+             asm!("fxrstor64 [{}]", in(reg) host_fpu.0.as_ptr());
+-            if rflags & (1 << 9) != 0 {
+-                asm!("sti");
++            // Interrupts are on after the run (IF was set before VMRUN); keep the caller's state.
++            if rflags & (1 << 9) == 0 {
++                asm!("cli");
+             }
+             Some(VmExit {
+                 code: self.vmcb.r64(CTRL_EXITCODE),
+-- 
+2.43.0
+

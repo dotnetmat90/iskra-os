@@ -1,6 +1,6 @@
 # Iskra roadmap
 
-Revised 2026-11-27 (hypervisor steps 1–6 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
+Revised 2026-11-27 (hypervisor steps 1–7 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
 The blueprint's vision stays: an OS built for AI agents, where the microkernel decides what an agent
 can see. Its 12-week schedule does not: it packs years of systems work (a hypervisor, IOMMU passthrough,
 a Linux driver VM, GPU gaming, power management) into weeks 5–12. This roadmap keeps the ambition but
@@ -108,9 +108,17 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
      swapped around VMRUN; XSETBV is intercepted; MSRs held in the VMCB (EFER, syscall MSRs,
      FS/GS bases, PAT) are answered in the kernel. `iskra-vmm-long` runs a long-mode guest with its
      own 4-level page tables that reads EFER (0x500 = LME|LMA) and prints through COM1.
-   - [ ] Step 7: run Linux with a small Rust VMM: Linux boot protocol (bzImage + initramfs, boot
-     params, e820), CPUID and MSR answers, serial console, 8259 PIC + 8254 PIT timer. A QEMU
-     accelerator backend on `/scheme/sys/vmm` remains the route to full device support.
+   - [x] **Step 7 done (2026-11-27): Linux runs in a VM on Iskra.** `iskra-vmm-linux` boots an
+     unmodified Linux 6.18 (Alpine's `virt` kernel, pinned by checksum) with a tiny initramfs:
+     64-bit boot protocol, 128 MiB RAM, CPUID passthrough minus unsupported features, unknown MSRs
+     as 0, a 16550-like serial console, 8259 PIC + 8254 PIT timer, CMOS registers, absent devices
+     reading 0xFF. Linux boots to `/init` in about 1.8 s of guest time (6.4 s wall clock under
+     QEMU's SVM emulation), its `/init` prints a greeting and the guest halts; 420 timer ticks
+     reach it. Bugs found on the way: the PIC init-sequence decoding in the VMM, and in the kernel,
+     host interrupts stayed masked while a guest ran (fixed by setting IF inside the CLGI window).
+   - [ ] Next for Linux: interactive console (serial input and the THRE interrupt for tty output),
+     virtio block/network devices, more than one vCPU, a local APIC; or a QEMU accelerator backend
+     on `/scheme/sys/vmm` for full device support.
    - [ ] Later: IOMMU (AMD-Vi) and device passthrough to the Linux VM.
    - [ ] Not yet tried on real AMD hardware or under nested KVM on Proxmox.
 4. Only after that: `dev-bridge` (.NET/Node/Docker ports over virtio-vsock), and a Linux "driver VM".

@@ -1,8 +1,21 @@
-# Iskra hypervisor userspace: iskra-vmm-hello, a minimal VMM that drives /scheme/sys/vmm.
+# Iskra hypervisor userspace: minimal VMMs that drive /scheme/sys/vmm, plus a Linux guest
+# (Alpine's virt kernel, pinned by checksum, and a tiny initramfs built here).
 # Needs a kernel with Iskra's hypervisor patches (config/iskra-hv.toml).
 [build]
 template = "custom"
 script = """
 "${COOKBOOK_CARGO}" install --path "${COOKBOOK_RECIPE}/crate" --root "${COOKBOOK_STAGE}/usr" \
     --target-dir "${COOKBOOK_BUILD}/target" ${install_flags}
+
+# Linux guest for iskra-vmm-linux
+SHARE="${COOKBOOK_STAGE}/usr/share/iskra-vmm"
+mkdir -p "${SHARE}"
+KERNEL_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/netboot/vmlinuz-virt
+KERNEL_SHA256=1e8ac7aebfab3f0fcb443eae94ad320efbbda51be91b928c32ca1740b44ebe9d
+curl -fsSL -o "${COOKBOOK_BUILD}/vmlinuz-virt" "${KERNEL_URL}"
+echo "${KERNEL_SHA256}  ${COOKBOOK_BUILD}/vmlinuz-virt" | sha256sum -c -
+cp "${COOKBOOK_BUILD}/vmlinuz-virt" "${SHARE}/vmlinuz"
+x86_64-unknown-redox-as "${COOKBOOK_RECIPE}/linux/init.S" -o "${COOKBOOK_BUILD}/init.o"
+x86_64-unknown-redox-ld -static -nostdlib -e _start "${COOKBOOK_BUILD}/init.o" -o "${COOKBOOK_BUILD}/init"
+python3 "${COOKBOOK_RECIPE}/linux/mkcpio.py" "${COOKBOOK_BUILD}/init" > "${SHARE}/initramfs.cpio"
 """
