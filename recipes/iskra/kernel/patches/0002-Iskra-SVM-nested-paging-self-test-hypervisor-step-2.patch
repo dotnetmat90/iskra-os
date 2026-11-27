@@ -1,7 +1,7 @@
-From b771cc2104398753b276a05aff79d25c3862f375 Mon Sep 17 00:00:00 2001
+From c0064b312405134b5e1c7b18304b1719f9f70912 Mon Sep 17 00:00:00 2001
 From: mattryznar <ryznarmat@gmail.com>
 Date: Fri, 27 Nov 2026 17:24:21 +0100
-Subject: [PATCH 2/2] Iskra: SVM nested paging self-test (hypervisor step 2)
+Subject: [PATCH 2/3] Iskra: SVM nested paging self-test (hypervisor step 2)
 
 A 32-bit paged guest runs in its own guest-physical address space through
 4-level nested page tables. It writes guest memory the host can read back,

@@ -1,0 +1,231 @@
+From 039126f6cb1a3705ec260d3f4a9269a4dd32d9c8 Mon Sep 17 00:00:00 2001
+From: mattryznar <ryznarmat@gmail.com>
+Date: Fri, 27 Nov 2026 17:28:57 +0100
+Subject: [PATCH 3/3] Iskra: SVM I/O exit self-test (hypervisor step 3)
+
+The guest prints a string to COM1; every OUT exits to the host through an
+all-ports I/O permission map, the host collects the byte and resumes the guest
+at EXITINFO2 (next RIP). The 32-bit paged guest setup is shared with the
+nested paging test (PagedGuest).
+---
+ src/arch/x86_shared/svm.rs | 155 +++++++++++++++++++++++++++++--------
+ 1 file changed, 123 insertions(+), 32 deletions(-)
+
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+index b6af8c25..aaa8236b 100644
+--- a/src/arch/x86_shared/svm.rs
++++ b/src/arch/x86_shared/svm.rs
+@@ -12,6 +12,9 @@
+ //!    then reads unmapped address 0x5000, which must exit with a nested page fault for 0x5000. The
+ //!    host maps a page holding 0xBEEF there and resumes; the guest must finish with AX = 0xBEEF.
+ //!    Proves NPT, NPF exits and resuming a guest after an exit (demand mapping).
++//! 3. `test_io_exits`: the guest prints a string to the serial port; every `out` exits to the host,
++//!    which collects the byte and resumes the guest after it. Proves I/O intercepts, the I/O
++//!    permission map and stepping a guest past an emulated instruction.
+ //!
+ //! VMCB offsets follow FreeBSD's sys/amd64/vmm/amd/vmcb.h (bhyve, BSD-2-Clause) and the AMD APM
+ //! vol. 2, appendix B.
+@@ -35,15 +38,18 @@ const CTRL_INST1_INTERCEPT: usize = 0x00C;
+ const CTRL_INST2_INTERCEPT: usize = 0x010;
+ const CTRL_ASID: usize = 0x058;
+ const CTRL_TLB_CTRL: usize = 0x05C;
++const CTRL_IOPM_BASE_PA: usize = 0x040;
+ const CTRL_EXITCODE: usize = 0x070;
+ const CTRL_EXITINFO1: usize = 0x078;
+ const CTRL_EXITINFO2: usize = 0x080;
+ const CTRL_NP_ENABLE: usize = 0x090;
+ const CTRL_N_CR3: usize = 0x0B0;
+ const INTCPT_HLT: u32 = 1 << 24;
++const INTCPT_IO: u32 = 1 << 27;
+ const INTCPT_SHUTDOWN: u32 = 1 << 31;
+ const INTCPT_VMRUN: u32 = 1 << 0; // architecturally required
+ const EXIT_HLT: u64 = 0x78;
++const EXIT_IO: u64 = 0x7B;
+ const EXIT_NPF: u64 = 0x400;
+ const EXIT_INVALID: u64 = u64::MAX;
+ 
+@@ -233,6 +239,51 @@ impl NestedPageTable {
+     }
+ }
+ 
++/// A 32-bit protected-mode guest with its own paging on (one 4 MiB identity page), so every access
++/// goes guest-linear -> guest-physical (guest tables) -> host-physical (nested tables), as in a real
++/// VM. (QEMU 8.2's SVM emulation skips nested paging for guests with paging off, which made a
++/// real-mode version of the nested paging test run host memory.)
++///
++/// Guest-physical layout: 0x0000 one page of code and data (`code` at offset 0), 0x1000 the guest
++/// page directory. Nothing else is mapped.
++struct PagedGuest {
++    npt: NestedPageTable,
++    vmcb: Vmcb,
++    page0_va: *mut u8,
++}
++
++impl PagedGuest {
++    fn new(code: &[u8]) -> Result<Self, &'static str> {
++        const GUEST_PD: u64 = 0x1000;
++        let npt = NestedPageTable::new().ok_or("no frame for nested PML4")?;
++        let (page0_pa, page0_va) = zeroed_page().ok_or("no frame for guest page 0")?;
++        let (pd_pa, pd_va) = zeroed_page().ok_or("no frame for guest page directory")?;
++        unsafe {
++            core::ptr::copy_nonoverlapping(code.as_ptr(), page0_va, code.len());
++            // PDE 0: 4 MiB page at guest-physical 0, present | writable | page size.
++            pd_va.cast::<u32>().write_unaligned(0x0000_0083);
++        }
++        npt.map_4k(0, page0_pa).ok_or("no frame for nested page tables")?;
++        npt.map_4k(GUEST_PD, pd_pa).ok_or("no frame for nested page tables")?;
++
++        let v = Vmcb::real_mode(0).ok_or("no frame for VMCB")?;
++        unsafe {
++            const CODE32: u16 = 0x0C9B; // G, D, present, S, type 0xB
++            const DATA32: u16 = 0x0C93; // G, B, present, S, type 0x3
++            v.seg(SEG_CS, 0x08, CODE32, 0xFFFF_FFFF, 0);
++            for off in [SEG_ES, SEG_SS, SEG_DS, SEG_FS, SEG_GS] {
++                v.seg(off, 0x10, DATA32, 0xFFFF_FFFF, 0);
++            }
++            v.w64(STATE_CR0, 0x8000_0011); // PG | ET | PE
++            v.w64(STATE_CR3, GUEST_PD);
++            v.w64(STATE_CR4, 0x10); // PSE: 4 MiB pages
++            v.w64(CTRL_NP_ENABLE, 1);
++            v.w64(CTRL_N_CR3, npt.pml4);
++        }
++        Ok(Self { npt, vmcb: v, page0_va })
++    }
++}
++
+ pub fn selftest() {
+     if let Err(why) = svm_supported() {
+         info!("iskra-svm: skipped: {}", why);
+@@ -254,6 +305,7 @@ pub fn selftest() {
+         info!("iskra-svm: nested paging: skipped: CPU has no NPT (CPUID 8000_000Ah EDX bit 0)");
+     } else {
+         report("nested paging", &test_nested_paging());
++        report("io exits", &test_io_exits());
+     }
+ }
+ 
+@@ -294,11 +346,6 @@ fn test_direct() -> Result<(), &'static str> {
+ 
+ /// Step 2: guest in its own address space via nested paging, with demand mapping.
+ fn test_nested_paging() -> Result<(), &'static str> {
+-    // A 32-bit protected-mode guest with its own paging on (one 4 MiB identity page), so every
+-    // access goes guest-linear -> guest-physical (guest tables) -> host-physical (nested tables),
+-    // as in a real VM. (QEMU 8.2's SVM emulation skips nested paging for guests with paging off,
+-    // which made a real-mode version of this test run host memory.)
+-    //
+     // Guest-physical layout: 0x0000 code + data, 0x1000 guest page directory, 0x5000 unmapped.
+     //   0: B8 34 12 00 00   mov eax, 0x1234
+     //   5: A3 00 01 00 00   mov [0x100], eax
+@@ -308,34 +355,8 @@ fn test_nested_paging() -> Result<(), &'static str> {
+         0xB8, 0x34, 0x12, 0x00, 0x00, 0xA3, 0x00, 0x01, 0x00, 0x00, 0xA1, 0x00, 0x50, 0x00, 0x00,
+         0xF4,
+     ];
+-    const GUEST_PD: u64 = 0x1000;
+     const LATE_GPA: u64 = 0x5000;
+-
+-    let npt = NestedPageTable::new().ok_or("no frame for nested PML4")?;
+-    let (page0_pa, page0_va) = zeroed_page().ok_or("no frame for guest page 0")?;
+-    let (pd_pa, pd_va) = zeroed_page().ok_or("no frame for guest page directory")?;
+-    unsafe {
+-        core::ptr::copy_nonoverlapping(CODE.as_ptr(), page0_va, CODE.len());
+-        // PDE 0: 4 MiB page at guest-physical 0, present | writable | page size.
+-        pd_va.cast::<u32>().write_unaligned(0x0000_0083);
+-    }
+-    npt.map_4k(0, page0_pa).ok_or("no frame for nested page tables")?;
+-    npt.map_4k(GUEST_PD, pd_pa).ok_or("no frame for nested page tables")?;
+-
+-    let v = Vmcb::real_mode(0).ok_or("no frame for VMCB")?;
+-    unsafe {
+-        const CODE32: u16 = 0x0C9B; // G, D, present, S, type 0xB
+-        const DATA32: u16 = 0x0C93; // G, B, present, S, type 0x3
+-        v.seg(SEG_CS, 0x08, CODE32, 0xFFFF_FFFF, 0);
+-        for off in [SEG_ES, SEG_SS, SEG_DS, SEG_FS, SEG_GS] {
+-            v.seg(off, 0x10, DATA32, 0xFFFF_FFFF, 0);
+-        }
+-        v.w64(STATE_CR0, 0x8000_0011); // PG | ET | PE
+-        v.w64(STATE_CR3, GUEST_PD);
+-        v.w64(STATE_CR4, 0x10); // PSE: 4 MiB pages
+-        v.w64(CTRL_NP_ENABLE, 1);
+-        v.w64(CTRL_N_CR3, npt.pml4);
+-    }
++    let PagedGuest { npt, vmcb: v, page0_va } = PagedGuest::new(&CODE)?;
+ 
+     // Run 1: the read of 0x5000 must fault to the host.
+     let exit = v.run();
+@@ -364,3 +385,73 @@ fn test_nested_paging() -> Result<(), &'static str> {
+         Err(explain(exit))
+     }
+ }
++
++/// Step 3: I/O exits. The guest writes a string to the serial port 0x3F8 one byte at a time; every
++/// `out` exits to the host (all ports intercepted), which collects the byte and resumes the guest
++/// at the next instruction. This is how a VMM emulates a device for a guest.
++fn test_io_exits() -> Result<(), &'static str> {
++    //   0: BE 40 00 00 00   mov esi, 0x40        ; message
++    //   5: 66 BA F8 03      mov dx, 0x3F8        ; COM1 data port
++    //   9: AC               lodsb
++    //  10: 84 C0            test al, al
++    //  12: 74 03            jz 17
++    //  14: EE               out dx, al           -> I/O exit
++    //  15: EB F8            jmp 9
++    //  17: F4               hlt
++    const CODE: [u8; 18] = [
++        0xBE, 0x40, 0x00, 0x00, 0x00, 0x66, 0xBA, 0xF8, 0x03, 0xAC, 0x84, 0xC0, 0x74, 0x03, 0xEE,
++        0xEB, 0xF8, 0xF4,
++    ];
++    const MESSAGE: &[u8] = b"Hello from a guest inside Iskra\0";
++    const COM1: u64 = 0x3F8;
++
++    let guest = PagedGuest::new(&CODE)?;
++    unsafe { core::ptr::copy_nonoverlapping(MESSAGE.as_ptr(), guest.page0_va.add(0x40), MESSAGE.len()) };
++
++    // I/O permission map: 12 KiB of physically contiguous memory, every bit set = intercept every port.
++    let iopm = crate::memory::allocate_p2frame(2, true).ok_or("no frames for I/O permission map")?;
++    let iopm_pa = iopm.base().data() as u64;
++    unsafe {
++        core::ptr::write_bytes(RmmA::phys_to_virt(iopm.base()).data() as *mut u8, 0xFF, 3 * 4096);
++        let v = &guest.vmcb;
++        v.w64(CTRL_IOPM_BASE_PA, iopm_pa);
++        v.w32(CTRL_INST1_INTERCEPT, INTCPT_HLT | INTCPT_SHUTDOWN | INTCPT_IO);
++    }
++
++    let v = &guest.vmcb;
++    let mut out = [0u8; 64];
++    let mut len = 0;
++    for _ in 0..out.len() + 1 {
++        let exit = v.run();
++        match exit {
++            EXIT_IO => {
++                let info1 = unsafe { v.r64(CTRL_EXITINFO1) };
++                let is_in = info1 & 1 != 0;
++                let size = (info1 >> 4) & 0x7; // bit 4: 8-bit, 5: 16-bit, 6: 32-bit
++                let port = info1 >> 16;
++                if is_in || size != 1 || port != COM1 || len == out.len() {
++                    v.log_exit("io exits");
++                    return Err("unexpected I/O access");
++                }
++                out[len] = v.ax() as u8;
++                len += 1;
++                // EXITINFO2 holds the address of the instruction after the OUT.
++                unsafe { v.w64(STATE_RIP, v.r64(CTRL_EXITINFO2)) };
++            }
++            EXIT_HLT => {
++                let text = core::str::from_utf8(&out[..len]).unwrap_or("<not utf-8>");
++                info!("iskra-svm: io exits: guest wrote {} bytes to COM1: {:?}", len, text);
++                return if &out[..len] == &MESSAGE[..MESSAGE.len() - 1] {
++                    Ok(())
++                } else {
++                    Err("guest output differs from its message")
++                };
++            }
++            other => {
++                v.log_exit("io exits");
++                return Err(explain(other));
++            }
++        }
++    }
++    Err("guest did not halt")
++}
+-- 
+2.43.0
+
