@@ -1,6 +1,6 @@
 # Iskra roadmap
 
-Revised 2026-11-27 (hypervisor steps 1–4 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
+Revised 2026-11-27 (hypervisor steps 1–5 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
 The blueprint's vision stays: an OS built for AI agents, where the microkernel decides what an agent
 can see. Its 12-week schedule does not: it packs years of systems work (a hypervisor, IOMMU passthrough,
 a Linux driver VM, GPU gaming, power management) into weeks 5–12. This roadmap keeps the ambition but
@@ -99,8 +99,11 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
      `iskra-vmm`) runs a guest that prints through the serial port into the Iskra terminal.
      (It lives under `sys` because a new top-level kernel scheme also needs Redox's userspace
      bootstrap to know its name; a proper `/scheme/vmm` is an upstream change.)
-   - [ ] Step 5: interrupt injection (event injection, interrupt windows) and a timer, so a guest
-     can take interrupts.
+   - [x] **Step 5 done (2026-11-27): interrupts.** `/scheme/sys/vmm` offset `INJECT` queues an
+     external interrupt; the kernel injects it when the guest can take it, or opens an interrupt
+     window and delivers it right after the guest's STI; events cut off by an exit are re-delivered.
+     `iskra-vmm-timer` runs a guest with its own GDT/IDT that takes five 100 ms timer ticks
+     (the first through the interrupt window). The timer itself lives in the VMM, as in real VMMs.
    - [ ] Step 6: 64-bit long-mode guests and the Linux boot protocol (load bzImage + initramfs,
      boot params, serial console).
    - [ ] Step 7: run Linux: either a small Rust VMM (CPUID/MSR answers, serial, PIT/PIC or LAPIC

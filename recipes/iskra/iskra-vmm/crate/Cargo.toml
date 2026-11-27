@@ -3,8 +3,12 @@ name = "iskra-vmm"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Minimal VMM for Iskra's /scheme/sys/vmm"
+description = "Minimal VMMs for Iskra's /scheme/sys/vmm"
 
 [[bin]]
 name = "iskra-vmm-hello"
 path = "src/main.rs"
+
+[[bin]]
+name = "iskra-vmm-timer"
+path = "src/bin/iskra-vmm-timer.rs"

@@ -1,0 +1,163 @@
+From 1af3227fd28b8eaf40b9cceb0114e8b46079c0ab Mon Sep 17 00:00:00 2001
+From: mattryznar <ryznarmat@gmail.com>
+Date: Fri, 27 Nov 2026 17:50:14 +0100
+Subject: [PATCH 5/5] Iskra: interrupt injection for vmm guests (hypervisor
+ step 5)
+
+/scheme/sys/vmm offset INJECT queues an external interrupt. The kernel injects
+it via EVENTINJ when the guest has IF set and no interrupt shadow; otherwise
+it opens an interrupt window (V_IRQ, ignore TPR, VINTR intercept) and injects
+on the VINTR exit without returning to userspace. Events cut off by an exit
+(EXITINTINFO) are re-delivered on the next run.
+---
+ src/arch/x86_shared/svm.rs | 75 +++++++++++++++++++++++++++++++++++++-
+ src/scheme/sys/vmm.rs      | 10 +++++
+ 2 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+index 9481800e..d24e612d 100644
+--- a/src/arch/x86_shared/svm.rs
++++ b/src/arch/x86_shared/svm.rs
+@@ -469,7 +469,17 @@ use crate::{
+ };
+ 
+ const CTRL_MSRPM_BASE_PA: usize = 0x048;
++const CTRL_V_IRQ: usize = 0x061; // bit 0: virtual interrupt pending
++const CTRL_V_INTR_PRIO: usize = 0x062; // bits 0-3 priority, bit 4 ignore TPR
+ const CTRL_V_INTR_MASKING: usize = 0x063; // bit 0
++const CTRL_V_INTR_VECTOR: usize = 0x064;
++const CTRL_INTR_SHADOW: usize = 0x068; // bit 0
++const CTRL_EXITINTINFO: usize = 0x088;
++const CTRL_EVENTINJ: usize = 0x0A8;
++const EVENT_VALID: u64 = 1 << 31; // type 0 (external interrupt) in bits 8-10
++const INTCPT_VINTR: u32 = 1 << 4;
++const EXIT_VINTR: u64 = 0x64;
++const RFLAGS_IF: u64 = 1 << 9;
+ const STATE_CR2: usize = STATE + 0x240;
+ const INTCPT_INTR: u32 = 1 << 0;
+ const INTCPT_NMI: u32 = 1 << 1;
+@@ -547,6 +557,8 @@ pub struct Vm {
+     pages: BTreeMap<u64, Frame>,
+     /// Nested page tables, VMCB and permission maps, freed with the VM: (frame, order).
+     owned: Vec<(Frame, u32)>,
++    /// External interrupt queued by userspace, delivered as soon as the guest can take it.
++    pending_irq: Option<u8>,
+ }
+ 
+ // Only physical addresses and kernel-direct-map pointers inside; access is serialized by the scheme.
+@@ -588,7 +600,7 @@ impl Vm {
+             vmcb.w64(CTRL_NP_ENABLE, 1);
+             vmcb.w64(CTRL_N_CR3, npt);
+         }
+-        Some(Self { vmcb, gpr: [0; 16], npt, pages: BTreeMap::new(), owned })
++        Some(Self { vmcb, gpr: [0; 16], npt, pages: BTreeMap::new(), owned, pending_irq: None })
+     }
+ 
+     /// Host frame backing guest page `gpa_page`, allocated and mapped on first use.
+@@ -682,8 +694,67 @@ impl Vm {
+         }
+     }
+ 
+-    /// Run the guest until its next #VMEXIT.
++    /// Queue an external interrupt (vector 32-255); it is delivered on a later run as soon as the
++    /// guest has interrupts enabled. One interrupt can be pending at a time (a newer one replaces
++    /// it), like a single interrupt line.
++    pub fn queue_interrupt(&mut self, vector: u8) {
++        self.pending_irq = Some(vector);
++    }
++
++    /// Inject the pending interrupt if the guest can take it now, otherwise ask the CPU to exit
++    /// as soon as it can (interrupt window, VINTR), as bhyve does.
++    fn prepare_injection(&mut self) {
++        let Some(vector) = self.pending_irq else { return };
++        let v = &self.vmcb;
++        unsafe {
++            if v.r64(CTRL_EVENTINJ) & EVENT_VALID != 0 {
++                return; // an interrupted delivery is being retried first
++            }
++            let can_take = v.r64(STATE_RFLAGS) & RFLAGS_IF != 0 && *v.va.add(CTRL_INTR_SHADOW) & 1 == 0;
++            if can_take {
++                v.w64(CTRL_EVENTINJ, vector as u64 | EVENT_VALID);
++                self.pending_irq = None;
++                self.set_window(false);
++            } else {
++                self.set_window(true);
++            }
++        }
++    }
++
++    fn set_window(&self, open: bool) {
++        let v = &self.vmcb;
++        unsafe {
++            *v.va.add(CTRL_V_IRQ) = open as u8;
++            *v.va.add(CTRL_V_INTR_PRIO) = if open { 0x1F } else { 0 }; // priority 15, ignore TPR
++            *v.va.add(CTRL_V_INTR_VECTOR) = 0;
++            let intercepts = v.va.add(CTRL_INST1_INTERCEPT).cast::<u32>().read_unaligned();
++            let intercepts = if open { intercepts | INTCPT_VINTR } else { intercepts & !INTCPT_VINTR };
++            v.w32(CTRL_INST1_INTERCEPT, intercepts);
++        }
++    }
++
++    /// Run the guest until its next #VMEXIT that userspace must see. Interrupt-window exits are
++    /// handled here: the pending interrupt is injected and the guest resumes.
+     pub fn run(&mut self) -> Option<VmExit> {
++        loop {
++            self.prepare_injection();
++            let exit = self.enter()?;
++            unsafe {
++                // An event cut off by the exit is re-delivered on the next run (APM 15.7.2).
++                let intinfo = self.vmcb.r64(CTRL_EXITINTINFO);
++                let retry = if intinfo & EVENT_VALID != 0 { intinfo } else { 0 };
++                self.vmcb.w64(CTRL_EVENTINJ, retry);
++            }
++            if exit.code == EXIT_VINTR {
++                self.set_window(false);
++                continue;
++            }
++            return Some(exit);
++        }
++    }
++
++    /// One VMRUN, until the next #VMEXIT of any kind.
++    fn enter(&mut self) -> Option<VmExit> {
+         let vmcb_pa = self.vmcb.pa;
+         let gpr = self.gpr.as_mut_ptr();
+         unsafe {
+diff --git a/src/scheme/sys/vmm.rs b/src/scheme/sys/vmm.rs
+index 91ea6d57..e5bea5fc 100644
+--- a/src/scheme/sys/vmm.rs
++++ b/src/scheme/sys/vmm.rs
+@@ -8,6 +8,7 @@
+ //! | `0 .. 1 TiB`        | guest memory at that guest-physical address (pages allocated on first write) | guest memory |
+ //! | [`REGS`] (1 << 48)  | vCPU registers ([`VmRegs`])              | vCPU registers                |
+ //! | [`RUN`]  (REGS + 4 KiB) | -                                    | run until the next exit, returns [`VmExit`] |
++//! | [`INJECT`] (REGS + 8 KiB) | interrupt vector (u64, 32-255) to deliver as soon as the guest can take it | - |
+ //!
+ //! The kernel intercepts interrupts, every I/O port, every MSR, CPUID and HLT, so a guest never
+ //! reaches host hardware or host MSRs; userspace decides how to answer each exit. Closing the
+@@ -31,6 +32,7 @@ use super::{Handle, HANDLES};
+ 
+ pub const REGS: u64 = 1 << 48;
+ pub const RUN: u64 = REGS + 0x1000;
++pub const INJECT: u64 = REGS + 0x2000;
+ /// Largest single memory read or write.
+ const MAX_IO: usize = 1 << 20;
+ 
+@@ -116,6 +118,14 @@ pub fn write(id: usize, buf: UserSliceRo, pos: u64, token: &mut CleanLockToken)
+             with_vm(id, token, |vm| vm.set_regs(&regs))?;
+             return Ok(core::mem::size_of::<VmRegs>());
+         }
++        if pos == INJECT {
++            let vector = buf.read_usize()?;
++            if !(32..=255).contains(&vector) {
++                return Err(Error::new(EINVAL));
++            }
++            with_vm(id, token, |vm| vm.queue_interrupt(vector as u8))?;
++            return Ok(core::mem::size_of::<usize>());
++        }
+         if pos < VM_GPA_LIMIT {
+             let mut data = vec![0u8; buf.len().min(MAX_IO)];
+             let n = buf.copy_common_bytes_to_slice(&mut data)?;
+-- 
+2.43.0
+
