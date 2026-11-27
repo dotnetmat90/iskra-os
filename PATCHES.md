@@ -17,7 +17,7 @@ Patches to code outside this repository (kept in `recipes/iskra/<name>/patches/`
 | smithay | `reis` made optional, only with `backend_libei` | its socket flags do not exist on Redox; upstream bug worth reporting |
 | smithay | winit backend: Redox key-name → Linux key-code table | winit has no scancode extension on Redox; without it keyboards send nothing (the cause of cosmic-comp's "no keyboard input") |
 | winit, winit-orbital 0.31.0-beta.4; redox_event 0.4.8 | Orbital event loop exposes its event-queue fd | smithay polls winit's loop through that fd; only Linux had it |
-| Redox kernel @ 8d5f7753 (`recipes/iskra/kernel/`) | `src/arch/x86_shared/svm.rs`: AMD SVM bring-up self-tests at boot (direct guest; nested paging with demand mapping; I/O exits), behind feature `iskra_svm_selftest` | Hypervisor steps 1–3 (ROADMAP.md Phase 3). Built only by `config/iskra-hv.toml`. |
+| Redox kernel @ 8d5f7753 (`recipes/iskra/kernel/`) | `src/arch/x86_shared/svm.rs`: AMD SVM self-tests at boot and the `Vm` object; `src/scheme/sys/vmm.rs` + `sys/mod.rs`: `/scheme/sys/vmm` for userspace VMMs. Behind feature `iskra_svm_selftest` | Hypervisor steps 1–4 (ROADMAP.md Phase 3). Built only by `config/iskra-hv.toml`. |
 | xfwl4 (in its recipe script) | `WindowSurface` import and `X11Surface` match ungated; pixman renderer enabled; `PREFIX=/usr`; defaults file installed | upstream assumes its default Linux features; reportable |
 
 Iskra-only files: `ISKRA.md`, `PATCHES.md`, `iskra.sh`, `config/iskra.toml`, and `branding/`:
@@ -25,4 +25,4 @@ Iskra-only files: `ISKRA.md`, `PATCHES.md`, `iskra.sh`, `config/iskra.toml`, and
 - `branding/share/` mirrors `/usr/share/`; every file in it replaces upstream's.
 - `branding/synthwave.sh` renders the wallpaper and login art with ImageMagick 7.
 - `branding/shots.py` boots the image headless and saves screenshots (login, desktop, and any keyboard/mouse steps you pass).
-- `recipes/iskra/`: `iskra-tools` (the `ai` command), `kernel` (hypervisor patches, `prepare.sh`) and `xfwl4` (experiment, see `config/iskra-xfwl4.toml`).
+- `recipes/iskra/`: `iskra-tools` (the `ai` command), `kernel` (hypervisor patches, `prepare.sh`), `iskra-vmm` (`iskra-vmm-hello`, a minimal userspace VMM) and `xfwl4` (experiment, see `config/iskra-xfwl4.toml`).

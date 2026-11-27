@@ -1,0 +1,8 @@
+# Iskra hypervisor userspace: iskra-vmm-hello, a minimal VMM that drives /scheme/sys/vmm.
+# Needs a kernel with Iskra's hypervisor patches (config/iskra-hv.toml).
+[build]
+template = "custom"
+script = """
+"${COOKBOOK_CARGO}" install --path "${COOKBOOK_RECIPE}/crate" --root "${COOKBOOK_STAGE}/usr" \
+    --target-dir "${COOKBOOK_BUILD}/target" ${install_flags}
+"""

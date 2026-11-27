@@ -1,0 +1,608 @@
+From fb54eee35551c9c9c89b91e8ac49b6418703afb6 Mon Sep 17 00:00:00 2001
+From: mattryznar <ryznarmat@gmail.com>
+Date: Fri, 27 Nov 2026 17:42:51 +0100
+Subject: [PATCH 4/4] Iskra: /scheme/sys/vmm, VMs for userspace (hypervisor
+ step 4)
+
+Opening /scheme/sys/vmm (root) creates a VM with one SVM vCPU and nested paging.
+pwrite/pread below 1 TiB access guest memory (pages allocated on first write);
+offset 1<<48 reads/writes VmRegs; offset (1<<48)+4K runs until the next exit and
+returns VmExit. The kernel intercepts interrupts, all I/O ports, all MSRs,
+CPUID, HLT and SVM instructions. vCPU runs switch all guest GPRs and use
+VMSAVE/VMLOAD so FS/GS/TR and syscall MSRs never leak between host and guest;
+SVM is enabled per CPU on first use. Closing the handle frees the VM.
+---
+ src/arch/x86_shared/svm.rs | 326 +++++++++++++++++++++++++++++++++++++
+ src/scheme/sys/mod.rs      |  30 +++-
+ src/scheme/sys/vmm.rs      | 137 ++++++++++++++++
+ 3 files changed, 489 insertions(+), 4 deletions(-)
+ create mode 100644 src/scheme/sys/vmm.rs
+
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+index aaa8236b..9481800e 100644
+--- a/src/arch/x86_shared/svm.rs
++++ b/src/arch/x86_shared/svm.rs
+@@ -455,3 +455,329 @@ fn test_io_exits() -> Result<(), &'static str> {
+     }
+     Err("guest did not halt")
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Step 4: a VM that userspace drives through /scheme/sys/vmm (see scheme/sys/vmm.rs).
++// ---------------------------------------------------------------------------------------------
++
++use alloc::{collections::BTreeMap, vec::Vec};
++use core::sync::atomic::{AtomicU64, Ordering};
++
++use crate::{
++    cpu_set::MAX_CPU_COUNT,
++    memory::{Frame, PhysicalAddress, allocate_p2frame, deallocate_frame, deallocate_p2frame},
++};
++
++const CTRL_MSRPM_BASE_PA: usize = 0x048;
++const CTRL_V_INTR_MASKING: usize = 0x063; // bit 0
++const STATE_CR2: usize = STATE + 0x240;
++const INTCPT_INTR: u32 = 1 << 0;
++const INTCPT_NMI: u32 = 1 << 1;
++const INTCPT_SMI: u32 = 1 << 2;
++const INTCPT_INIT: u32 = 1 << 3;
++const INTCPT_CPUID: u32 = 1 << 18;
++const INTCPT_MSR: u32 = 1 << 28;
++const INTCPT_SVM_INSNS: u32 = 0x7F; // VMRUN VMMCALL VMLOAD VMSAVE STGI CLGI SKINIT
++
++/// Highest guest-physical address userspace may populate (1 TiB).
++pub const VM_GPA_LIMIT: u64 = 1 << 40;
++
++/// One segment register, in VMCB order and format.
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug)]
++pub struct VmSeg {
++    pub selector: u16,
++    pub attrib: u16,
++    pub limit: u32,
++    pub base: u64,
++}
++
++/// vCPU registers exchanged with userspace. `gpr` is in x86 encoding order:
++/// rax rcx rdx rbx rsp rbp rsi rdi r8..r15. `seg`: es cs ss ds fs gs gdtr ldtr idtr tr.
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug)]
++pub struct VmRegs {
++    pub gpr: [u64; 16],
++    pub rip: u64,
++    pub rflags: u64,
++    pub cr0: u64,
++    pub cr2: u64,
++    pub cr3: u64,
++    pub cr4: u64,
++    pub efer: u64,
++    pub seg: [VmSeg; 10],
++}
++
++/// Why the guest stopped: the SVM exit code and its two info words.
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug)]
++pub struct VmExit {
++    pub code: u64,
++    pub info1: u64,
++    pub info2: u64,
++}
++
++/// Per-CPU page where the host's FS/GS/TR/LDTR and syscall MSRs are kept during a guest run.
++static HOST_VMSAVE_PA: [AtomicU64; MAX_CPU_COUNT as usize] =
++    [const { AtomicU64::new(0) }; MAX_CPU_COUNT as usize];
++
++/// Make sure SVM is on for the CPU we are on (interrupts must be off).
++fn svm_on_this_cpu() -> Option<u64> {
++    let cpu = crate::cpu_id().get() as usize;
++    let host = HOST_VMSAVE_PA.get(cpu)?;
++    if host.load(Ordering::Relaxed) == 0 {
++        let (hsave, _) = zeroed_page()?;
++        let (vmsave, _) = zeroed_page()?;
++        unsafe {
++            let efer = x86::msr::rdmsr(MSR_EFER);
++            x86::msr::wrmsr(MSR_EFER, efer | EFER_SVME);
++            x86::msr::wrmsr(MSR_VM_HSAVE_PA, hsave);
++        }
++        host.store(vmsave, Ordering::Relaxed);
++    }
++    Some(host.load(Ordering::Relaxed))
++}
++
++pub struct Vm {
++    vmcb: Vmcb,
++    /// Guest general registers that VMRUN does not switch (RAX and RSP live in the VMCB).
++    gpr: [u64; 16],
++    npt: u64,
++    /// guest-physical page -> host frame
++    pages: BTreeMap<u64, Frame>,
++    /// Nested page tables, VMCB and permission maps, freed with the VM: (frame, order).
++    owned: Vec<(Frame, u32)>,
++}
++
++// Only physical addresses and kernel-direct-map pointers inside; access is serialized by the scheme.
++unsafe impl Send for Vm {}
++unsafe impl Sync for Vm {}
++
++impl Vm {
++    pub fn new() -> Option<Self> {
++        svm_supported().ok()?;
++        npt_supported().then_some(())?;
++        let mut owned = Vec::new();
++        let mut alloc = |order: u32, fill: u8| -> Option<u64> {
++            let frame = allocate_p2frame(order, true)?;
++            owned.push((frame, order));
++            if fill != 0 {
++                let va = RmmA::phys_to_virt(frame.base()).data() as *mut u8;
++                unsafe { core::ptr::write_bytes(va, fill, 4096 << order) };
++            }
++            Some(frame.base().data() as u64)
++        };
++        let npt = alloc(0, 0)?;
++        let iopm = alloc(2, 0xFF)?; // 12 KiB used: intercept every port
++        let msrpm = alloc(1, 0xFF)?; // 8 KiB: intercept every MSR read and write
++
++        // Start from the reset-like real-mode state; userspace sets real registers before running.
++        let vmcb = Vmcb::real_mode(0)?;
++        owned.push((Frame::containing(PhysicalAddress::new(vmcb.pa as usize)), 0));
++        unsafe {
++            vmcb.w32(CTRL_EXC_INTERCEPT, 0); // the guest handles its own exceptions
++            vmcb.w32(
++                CTRL_INST1_INTERCEPT,
++                INTCPT_INTR | INTCPT_NMI | INTCPT_SMI | INTCPT_INIT | INTCPT_CPUID | INTCPT_HLT
++                    | INTCPT_IO | INTCPT_MSR | INTCPT_SHUTDOWN,
++            );
++            vmcb.w32(CTRL_INST2_INTERCEPT, INTCPT_SVM_INSNS);
++            vmcb.w64(CTRL_IOPM_BASE_PA, iopm);
++            vmcb.w64(CTRL_MSRPM_BASE_PA, msrpm);
++            *vmcb.va.add(CTRL_V_INTR_MASKING) = 1; // guest IF cannot block host interrupts
++            vmcb.w64(CTRL_NP_ENABLE, 1);
++            vmcb.w64(CTRL_N_CR3, npt);
++        }
++        Some(Self { vmcb, gpr: [0; 16], npt, pages: BTreeMap::new(), owned })
++    }
++
++    /// Host frame backing guest page `gpa_page`, allocated and mapped on first use.
++    fn page(&mut self, gpa_page: u64) -> Option<*mut u8> {
++        if !self.pages.contains_key(&gpa_page) {
++            let frame = allocate_frame(true)?;
++            let hpa = frame.base().data() as u64;
++            let mut table = self.npt;
++            for shift in [39, 30, 21] {
++                let entry = unsafe { virt(table).add(((gpa_page >> shift) & 0x1FF) as usize) };
++                if unsafe { *entry } & 1 == 0 {
++                    let next = allocate_frame(true)?;
++                    self.owned.push((next, 0));
++                    unsafe { *entry = next.base().data() as u64 | NPT_FLAGS };
++                }
++                table = unsafe { *entry } & 0x000F_FFFF_FFFF_F000;
++            }
++            unsafe { *virt(table).add(((gpa_page >> 12) & 0x1FF) as usize) = hpa | NPT_FLAGS };
++            self.pages.insert(gpa_page, frame);
++        }
++        let frame = *self.pages.get(&gpa_page)?;
++        Some(RmmA::phys_to_virt(frame.base()).data() as *mut u8)
++    }
++
++    /// Copy `data` into guest memory at `gpa`.
++    pub fn write_mem(&mut self, gpa: u64, data: &[u8]) -> Option<()> {
++        let mut done = 0;
++        while done < data.len() {
++            let addr = gpa.checked_add(done as u64).filter(|a| *a < VM_GPA_LIMIT)?;
++            let off = (addr & 0xFFF) as usize;
++            let n = (4096 - off).min(data.len() - done);
++            let page = self.page(addr & !0xFFF)?;
++            unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), page.add(off), n) };
++            done += n;
++        }
++        Some(())
++    }
++
++    /// Copy guest memory at `gpa` into `out` (unpopulated pages read as zero).
++    pub fn read_mem(&self, gpa: u64, out: &mut [u8]) {
++        let mut done = 0;
++        while done < out.len() {
++            let addr = gpa.wrapping_add(done as u64);
++            let off = (addr & 0xFFF) as usize;
++            let n = (4096 - off).min(out.len() - done);
++            match self.pages.get(&(addr & !0xFFF)) {
++                Some(frame) => unsafe {
++                    let page = RmmA::phys_to_virt(frame.base()).data() as *const u8;
++                    core::ptr::copy_nonoverlapping(page.add(off), out[done..].as_mut_ptr(), n);
++                },
++                None => out[done..done + n].fill(0),
++            }
++            done += n;
++        }
++    }
++
++    pub fn regs(&self) -> VmRegs {
++        let v = &self.vmcb;
++        let mut r = VmRegs { gpr: self.gpr, ..Default::default() };
++        unsafe {
++            r.gpr[0] = v.r64(STATE_RAX);
++            r.gpr[4] = v.r64(STATE_RSP);
++            r.rip = v.r64(STATE_RIP);
++            r.rflags = v.r64(STATE_RFLAGS);
++            r.cr0 = v.r64(STATE_CR0);
++            r.cr2 = v.r64(STATE_CR2);
++            r.cr3 = v.r64(STATE_CR3);
++            r.cr4 = v.r64(STATE_CR4);
++            r.efer = v.r64(STATE_EFER) & !EFER_SVME;
++            core::ptr::copy_nonoverlapping(v.va.add(SEG_ES) as *const VmSeg, r.seg.as_mut_ptr(), 10);
++        }
++        r
++    }
++
++    pub fn set_regs(&mut self, r: &VmRegs) {
++        self.gpr = r.gpr;
++        let v = &self.vmcb;
++        unsafe {
++            v.w64(STATE_RAX, r.gpr[0]);
++            v.w64(STATE_RSP, r.gpr[4]);
++            v.w64(STATE_RIP, r.rip);
++            v.w64(STATE_RFLAGS, r.rflags | 0x2);
++            v.w64(STATE_CR0, r.cr0);
++            v.w64(STATE_CR2, r.cr2);
++            v.w64(STATE_CR3, r.cr3);
++            v.w64(STATE_CR4, r.cr4);
++            v.w64(STATE_EFER, r.efer | EFER_SVME); // VMRUN requires guest EFER.SVME
++            core::ptr::copy_nonoverlapping(r.seg.as_ptr(), v.va.add(SEG_ES) as *mut VmSeg, 10);
++            // CPL follows SS.DPL (attribute bits 5-6).
++            *v.va.add(STATE_CPL) = ((r.seg[2].attrib >> 5) & 3) as u8;
++        }
++    }
++
++    /// Run the guest until its next #VMEXIT.
++    pub fn run(&mut self) -> Option<VmExit> {
++        let vmcb_pa = self.vmcb.pa;
++        let gpr = self.gpr.as_mut_ptr();
++        unsafe {
++            // Interrupts off so we stay on this CPU from the SVM check through VMRUN.
++            let rflags: u64;
++            asm!("pushfq", "pop {}", "cli", out(reg) rflags);
++            let Some(host_vmsave) = svm_on_this_cpu() else {
++                if rflags & (1 << 9) != 0 {
++                    asm!("sti");
++                }
++                return None;
++            };
++            // VMSAVE/VMLOAD swap FS, GS, TR, LDTR, KernelGsBase and the syscall MSRs, which VMRUN
++            // leaves alone; the kernel keeps per-CPU data behind GS. Guest GPRs other than
++            // RAX/RSP are loaded from and stored back to `self.gpr` around VMRUN.
++            asm!(
++                "push rbx",
++                "push rbp",
++                "push rdx",              // host VMSAVE area
++                "push rsi",              // VMCB
++                "push rdi",              // &gpr
++                "mov rax, rdx",
++                "vmsave rax",
++                "mov rax, rsi",
++                "vmload rax",
++                "mov rcx, [rdi + 8*1]",
++                "mov rdx, [rdi + 8*2]",
++                "mov rbx, [rdi + 8*3]",
++                "mov rbp, [rdi + 8*5]",
++                "mov rsi, [rdi + 8*6]",
++                "mov r8,  [rdi + 8*8]",
++                "mov r9,  [rdi + 8*9]",
++                "mov r10, [rdi + 8*10]",
++                "mov r11, [rdi + 8*11]",
++                "mov r12, [rdi + 8*12]",
++                "mov r13, [rdi + 8*13]",
++                "mov r14, [rdi + 8*14]",
++                "mov r15, [rdi + 8*15]",
++                "mov rdi, [rdi + 8*7]",
++                "clgi",
++                "vmrun rax",
++                "push rdi",              // guest rdi
++                "mov rdi, [rsp + 8]",    // &gpr
++                "mov [rdi + 8*1], rcx",
++                "mov [rdi + 8*2], rdx",
++                "mov [rdi + 8*3], rbx",
++                "mov [rdi + 8*5], rbp",
++                "mov [rdi + 8*6], rsi",
++                "mov [rdi + 8*8], r8",
++                "mov [rdi + 8*9], r9",
++                "mov [rdi + 8*10], r10",
++                "mov [rdi + 8*11], r11",
++                "mov [rdi + 8*12], r12",
++                "mov [rdi + 8*13], r13",
++                "mov [rdi + 8*14], r14",
++                "mov [rdi + 8*15], r15",
++                "pop rax",
++                "mov [rdi + 8*7], rax",
++                "pop rdi",
++                "pop rax",               // VMCB
++                "vmsave rax",
++                "pop rax",               // host VMSAVE area
++                "vmload rax",
++                "stgi",
++                "pop rbp",
++                "pop rbx",
++                inout("rdi") gpr => _,
++                inout("rsi") vmcb_pa => _,
++                inout("rdx") host_vmsave => _,
++                out("rax") _, out("rcx") _,
++                out("r8") _, out("r9") _, out("r10") _, out("r11") _,
++                out("r12") _, out("r13") _, out("r14") _, out("r15") _,
++            );
++            if rflags & (1 << 9) != 0 {
++                asm!("sti");
++            }
++            Some(VmExit {
++                code: self.vmcb.r64(CTRL_EXITCODE),
++                info1: self.vmcb.r64(CTRL_EXITINFO1),
++                info2: self.vmcb.r64(CTRL_EXITINFO2),
++            })
++        }
++    }
++}
++
++impl Drop for Vm {
++    fn drop(&mut self) {
++        unsafe {
++            for (_, frame) in core::mem::take(&mut self.pages) {
++                deallocate_frame(frame);
++            }
++            for (frame, order) in self.owned.drain(..) {
++                deallocate_p2frame(frame, order);
++            }
++        }
++    }
++}
+diff --git a/src/scheme/sys/mod.rs b/src/scheme/sys/mod.rs
+index 0c86c5f4..0a75b968 100644
+--- a/src/scheme/sys/mod.rs
++++ b/src/scheme/sys/mod.rs
+@@ -39,6 +39,7 @@ mod numa;
+ mod stat;
+ mod syscall;
+ mod uname;
++mod vmm;
+ 
+ enum Handle {
+     TopLevel,
+@@ -48,6 +49,8 @@ enum Handle {
+         data: Arc<RwLock<L1, Option<Vec<u8>>>>,
+     },
+     SchemeRoot,
++    /// Iskra: one VM per open of /scheme/sys/vmm.
++    Vm(vmm::Slot),
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -134,6 +137,13 @@ impl KernelScheme for SysScheme {
+         if path.is_empty() {
+             let id = HANDLES.write(token.token()).insert(Handle::TopLevel);
+ 
++            Ok(OpenResult::SchemeLocal(id, InternalFlags::POSITIONED))
++        } else if path == "vmm" {
++            if ctx.uid != 0 {
++                return Err(Error::new(EPERM));
++            }
++            let slot = vmm::create()?;
++            let id = HANDLES.write(token.token()).insert(Handle::Vm(slot));
+             Ok(OpenResult::SchemeLocal(id, InternalFlags::POSITIONED))
+         } else {
+             //Have to iterate to get the path without allocation
+@@ -159,7 +169,7 @@ impl KernelScheme for SysScheme {
+     fn fsize(&self, id: usize, token: &mut CleanLockToken) -> Result<u64> {
+         let (kind, data_lock) = {
+             match HANDLES.read(token.token()).get(id)? {
+-                Handle::TopLevel => return Ok(0),
++                Handle::TopLevel | Handle::Vm(_) => return Ok(0),
+                 Handle::Resource { kind, data, .. } => (*kind, data.clone()),
+                 Handle::SchemeRoot => return Err(Error::new(EBADF)),
+             }
+@@ -189,6 +199,7 @@ impl KernelScheme for SysScheme {
+         let path = match HANDLES.read(token.token()).get(id)? {
+             Handle::TopLevel => "",
+             Handle::Resource { path, .. } => path,
++            Handle::Vm(_) => "vmm",
+             Handle::SchemeRoot => return Err(Error::new(EBADF)),
+         };
+ 
+@@ -210,6 +221,9 @@ impl KernelScheme for SysScheme {
+         _stored_flags: u32,
+         token: &mut CleanLockToken,
+     ) -> Result<usize> {
++        if matches!(HANDLES.read(token.token()).get(id)?, Handle::Vm(_)) {
++            return vmm::read(id, buffer, pos, token);
++        }
+         let Ok(pos) = usize::try_from(pos) else {
+             return Ok(0);
+         };
+@@ -239,11 +253,14 @@ impl KernelScheme for SysScheme {
+         &self,
+         id: usize,
+         buffer: UserSliceRo,
+-        _pos: u64,
++        pos: u64,
+         _flags: u32,
+         _stored_flags: u32,
+         token: &mut CleanLockToken,
+     ) -> Result<usize> {
++        if matches!(HANDLES.read(token.token()).get(id)?, Handle::Vm(_)) {
++            return vmm::write(id, buffer, pos, token);
++        }
+         let handler = match *HANDLES.read(token.token()).get(id)? {
+             Handle::TopLevel
+             | Handle::Resource {
+@@ -253,7 +270,7 @@ impl KernelScheme for SysScheme {
+                 kind: Kind::Wr(handler),
+                 ..
+             } => handler,
+-            Handle::SchemeRoot => return Err(Error::new(EBADF)),
++            Handle::SchemeRoot | Handle::Vm(_) => return Err(Error::new(EBADF)),
+         };
+         let mut intermediate = [0_u8; 256];
+         let len = buffer.copy_common_bytes_to_slice(&mut intermediate)?;
+@@ -271,7 +288,7 @@ impl KernelScheme for SysScheme {
+             return Ok(0);
+         };
+         match HANDLES.read(token.token()).get(id)? {
+-            Handle::Resource { .. } => return Err(Error::new(ENOTDIR)),
++            Handle::Resource { .. } | Handle::Vm(_) => return Err(Error::new(ENOTDIR)),
+             Handle::SchemeRoot => return Err(Error::new(EBADF)),
+             Handle::TopLevel => {}
+         }
+@@ -293,6 +310,11 @@ impl KernelScheme for SysScheme {
+             match handles.get(id)? {
+                 Handle::Resource { kind, data, .. } => Some((*kind, data.clone())),
+                 Handle::TopLevel => None,
++                Handle::Vm(_) => {
++                    let stat = Stat { st_mode: 0o600 | MODE_FILE, ..Default::default() };
++                    buf.copy_exactly(&stat)?;
++                    return Ok(());
++                }
+                 Handle::SchemeRoot => return Err(Error::new(EBADF)),
+             }
+         };
+diff --git a/src/scheme/sys/vmm.rs b/src/scheme/sys/vmm.rs
+new file mode 100644
+index 00000000..91ea6d57
+--- /dev/null
++++ b/src/scheme/sys/vmm.rs
+@@ -0,0 +1,137 @@
++//! Iskra: `/scheme/sys/vmm`, the hypervisor interface for userspace (hypervisor step 4).
++//!
++//! Opening `/scheme/sys/vmm` (root only) creates one VM with one vCPU (AMD SVM, nested paging).
++//! The file offset selects what a read or write means:
++//!
++//! | offset              | write                                   | read                          |
++//! |---------------------|-----------------------------------------|-------------------------------|
++//! | `0 .. 1 TiB`        | guest memory at that guest-physical address (pages allocated on first write) | guest memory |
++//! | [`REGS`] (1 << 48)  | vCPU registers ([`VmRegs`])              | vCPU registers                |
++//! | [`RUN`]  (REGS + 4 KiB) | -                                    | run until the next exit, returns [`VmExit`] |
++//!
++//! The kernel intercepts interrupts, every I/O port, every MSR, CPUID and HLT, so a guest never
++//! reaches host hardware or host MSRs; userspace decides how to answer each exit. Closing the
++//! file destroys the VM and frees its memory. A simple VMM is therefore: pwrite code, pwrite
++//! registers, loop { pread RUN; handle exit; adjust registers }.
++//!
++//! [`VmRegs`]: crate::arch::svm::VmRegs
++//! [`VmExit`]: crate::arch::svm::VmExit
++
++use alloc::{boxed::Box, vec};
++
++use crate::{
++    sync::CleanLockToken,
++    syscall::{
++        error::{Error, Result, EBUSY, EINVAL, ENODEV},
++        usercopy::{UserSliceRo, UserSliceWo},
++    },
++};
++
++use super::{Handle, HANDLES};
++
++pub const REGS: u64 = 1 << 48;
++pub const RUN: u64 = REGS + 0x1000;
++/// Largest single memory read or write.
++const MAX_IO: usize = 1 << 20;
++
++#[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++mod imp {
++    pub use crate::arch::svm::{VM_GPA_LIMIT, Vm, VmExit, VmRegs};
++}
++
++/// A VM slot; `None` while a vCPU run has it checked out.
++#[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++pub type Slot = Option<Box<imp::Vm>>;
++#[cfg(not(all(target_arch = "x86_64", feature = "iskra_svm_selftest")))]
++pub type Slot = ();
++
++pub fn create() -> Result<Slot> {
++    #[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++    {
++        imp::Vm::new().map(|vm| Some(Box::new(vm))).ok_or(Error::new(ENODEV))
++    }
++    #[cfg(not(all(target_arch = "x86_64", feature = "iskra_svm_selftest")))]
++    {
++        Err(Error::new(ENODEV))
++    }
++}
++
++#[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++fn with_vm<R>(id: usize, token: &mut CleanLockToken, f: impl FnOnce(&mut imp::Vm) -> R) -> Result<R> {
++    let mut handles = HANDLES.write(token.token());
++    match handles.get_mut(id)? {
++        Handle::Vm(Some(vm)) => Ok(f(vm)),
++        Handle::Vm(None) => Err(Error::new(EBUSY)),
++        _ => Err(Error::new(EINVAL)),
++    }
++}
++
++pub fn read(id: usize, buf: UserSliceWo, pos: u64, token: &mut CleanLockToken) -> Result<usize> {
++    #[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++    {
++        use imp::*;
++        if pos == REGS {
++            let regs = with_vm(id, token, |vm| vm.regs())?;
++            return buf.copy_common_bytes_from_slice(bytes_of(&regs));
++        }
++        if pos == RUN {
++            // Check the VM out of the handle table so the lock is not held while the guest runs.
++            let mut vm = {
++                let mut handles = HANDLES.write(token.token());
++                match handles.get_mut(id)? {
++                    Handle::Vm(slot) => slot.take().ok_or(Error::new(EBUSY))?,
++                    _ => return Err(Error::new(EINVAL)),
++                }
++            };
++            let exit = vm.run();
++            if let Handle::Vm(slot) = HANDLES.write(token.token()).get_mut(id)? {
++                *slot = Some(vm);
++            }
++            let exit: VmExit = exit.ok_or(Error::new(ENODEV))?;
++            return buf.copy_common_bytes_from_slice(bytes_of(&exit));
++        }
++        if pos < VM_GPA_LIMIT {
++            let mut data = vec![0u8; buf.len().min(MAX_IO)];
++            with_vm(id, token, |vm| vm.read_mem(pos, &mut data))?;
++            return buf.copy_common_bytes_from_slice(&data);
++        }
++        Err(Error::new(EINVAL))
++    }
++    #[cfg(not(all(target_arch = "x86_64", feature = "iskra_svm_selftest")))]
++    {
++        let _ = (id, buf, pos, token);
++        Err(Error::new(ENODEV))
++    }
++}
++
++pub fn write(id: usize, buf: UserSliceRo, pos: u64, token: &mut CleanLockToken) -> Result<usize> {
++    #[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++    {
++        use imp::*;
++        if pos == REGS {
++            if buf.len() != core::mem::size_of::<VmRegs>() {
++                return Err(Error::new(EINVAL));
++            }
++            let regs: VmRegs = unsafe { buf.read_exact()? };
++            with_vm(id, token, |vm| vm.set_regs(&regs))?;
++            return Ok(core::mem::size_of::<VmRegs>());
++        }
++        if pos < VM_GPA_LIMIT {
++            let mut data = vec![0u8; buf.len().min(MAX_IO)];
++            let n = buf.copy_common_bytes_to_slice(&mut data)?;
++            with_vm(id, token, |vm| vm.write_mem(pos, &data[..n]))?.ok_or(Error::new(EINVAL))?;
++            return Ok(n);
++        }
++        Err(Error::new(EINVAL))
++    }
++    #[cfg(not(all(target_arch = "x86_64", feature = "iskra_svm_selftest")))]
++    {
++        let _ = (id, buf, pos, token);
++        Err(Error::new(ENODEV))
++    }
++}
++
++#[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++fn bytes_of<T: Copy>(value: &T) -> &[u8] {
++    unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>()) }
++}
+-- 
+2.43.0
+

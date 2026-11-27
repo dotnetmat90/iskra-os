@@ -1,6 +1,6 @@
 # Iskra roadmap
 
-Revised 2026-11-27 (hypervisor steps 1–3 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
+Revised 2026-11-27 (hypervisor steps 1–4 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
 The blueprint's vision stays: an OS built for AI agents, where the microkernel decides what an agent
 can see. Its 12-week schedule does not: it packs years of systems work (a hypervisor, IOMMU passthrough,
 a Linux driver VM, GPU gaming, power management) into weeks 5–12. This roadmap keeps the ambition but
@@ -92,7 +92,20 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
    - [x] **Step 3 done (2026-11-27): I/O exits.** The guest prints "Hello from a guest inside
      Iskra" to COM1; every `out` traps to the host through an all-ports I/O permission map, the host
      collects the byte and resumes the guest after the instruction (the basis of device emulation).
-   - [ ] Step 4: `/scheme/vmm` so userspace creates VMs, maps memory and runs vCPUs.
+   - [x] **Step 4 done (2026-11-27): VMs for userspace.** `/scheme/sys/vmm` (root): opening it
+     creates a VM; pwrite/pread below 1 TiB is guest memory, offset `1 << 48` the vCPU registers,
+     `(1 << 48) + 4 KiB` runs until the next exit. Guests can't reach host hardware or MSRs (all
+     intercepted); full register switching including VMSAVE/VMLOAD. `iskra-vmm-hello` (package
+     `iskra-vmm`) runs a guest that prints through the serial port into the Iskra terminal.
+     (It lives under `sys` because a new top-level kernel scheme also needs Redox's userspace
+     bootstrap to know its name; a proper `/scheme/vmm` is an upstream change.)
+   - [ ] Step 5: interrupt injection (event injection, interrupt windows) and a timer, so a guest
+     can take interrupts.
+   - [ ] Step 6: 64-bit long-mode guests and the Linux boot protocol (load bzImage + initramfs,
+     boot params, serial console).
+   - [ ] Step 7: run Linux: either a small Rust VMM (CPUID/MSR answers, serial, PIT/PIC or LAPIC
+     timer) or a QEMU accelerator backend on `/scheme/sys/vmm` (QEMU supplies all devices).
+   - [ ] Later: IOMMU (AMD-Vi) and device passthrough to the Linux VM.
    - [ ] Not yet tried on real AMD hardware or under nested KVM on Proxmox.
 4. Only after that: `dev-bridge` (.NET/Node/Docker ports over virtio-vsock), and a Linux "driver VM".
 
