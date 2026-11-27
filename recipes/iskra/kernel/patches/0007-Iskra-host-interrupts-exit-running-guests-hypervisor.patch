@@ -1,7 +1,7 @@
-From 6712ceafb6e598968271f602a5f6e0e51a21522a Mon Sep 17 00:00:00 2001
+From 319ee75c0ba0a7a0899fe259ed97d231dd7c62d0 Mon Sep 17 00:00:00 2001
 From: mattryznar <ryznarmat@gmail.com>
 Date: Fri, 27 Nov 2026 18:05:18 +0100
-Subject: [PATCH 7/7] Iskra: host interrupts exit running guests (hypervisor
+Subject: [PATCH 7/8] Iskra: host interrupts exit running guests (hypervisor
  step 7)
 
 Set IF inside the CLGI window before VMRUN. With V_INTR_MASKING the host IF at

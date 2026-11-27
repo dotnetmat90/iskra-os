@@ -1,0 +1,445 @@
+From c6857f3de4a4a8e18d9f5329b53d47eb42c29636 Mon Sep 17 00:00:00 2001
+From: iskra <iskra@localhost>
+Date: Fri, 27 Nov 2026 20:53:26 +0100
+Subject: [PATCH 8/8] Iskra: AMD-Vi IOMMU and PCI device passthrough for vmm
+ guests (hypervisor step 8)
+
+A VM can be given a host PCI device through /scheme/sys/vmm: ASSIGN points
+the device at a 4-level AMD-Vi I/O page table that maps guest-physical
+addresses to the VM's frames (the IOMMU starts lazily; every other device
+keeps an invalid DTE, i.e. untranslated DMA), PORTS opens one of its I/O BARs
+in the I/O permission map, MMIO maps a memory BAR into the nested page table
+uncached at its host address, and DEVCFG proxies its PCI config space.
+The device table entry is cleared before the VM's frames are freed.
+---
+ src/arch/x86_shared/amd_vi.rs | 193 ++++++++++++++++++++++++++++++++++
+ src/arch/x86_shared/mod.rs    |   2 +
+ src/arch/x86_shared/svm.rs    | 108 +++++++++++++++++++
+ src/scheme/sys/vmm.rs         |  34 ++++++
+ 4 files changed, 337 insertions(+)
+ create mode 100644 src/arch/x86_shared/amd_vi.rs
+
+diff --git a/src/arch/x86_shared/amd_vi.rs b/src/arch/x86_shared/amd_vi.rs
+new file mode 100644
+index 00000000..07abf1ef
+--- /dev/null
++++ b/src/arch/x86_shared/amd_vi.rs
+@@ -0,0 +1,193 @@
++//! Iskra: AMD-Vi (AMD I/O virtualization, the AMD IOMMU) for device passthrough (hypervisor step 8).
++//!
++//! Started lazily, the first time a VM is given a PCI device. Every device table entry starts
++//! invalid, which the IOMMU treats as "no translation": the host's own devices keep doing DMA
++//! exactly as before. Only a device assigned to a VM gets a valid entry, pointing at an I/O page
++//! table that maps guest-physical addresses to the VM's host frames, so the device can reach the
++//! guest's RAM and nothing else.
++//!
++//! Register and table layouts follow the AMD I/O Virtualization Technology (IOMMU) Specification
++//! (#48882): IVRS/IVHD (ch. 5), device table entry (2.2.2), I/O page tables (2.2.3), MMIO registers
++//! (3.4) and commands (2.4).
++//!
++//! ponytail: one IOMMU (the first IVHD), segment 0 only, no interrupt remapping, the event log is
++//! enabled but never read; add those when real AMD hardware or several IOMMUs need them.
++
++use core::ptr::{read_volatile, write_volatile};
++
++use spin::Mutex;
++
++use crate::{
++    acpi::find_sdt,
++    memory::{allocate_p2frame, PhysicalAddress, RmmA, RmmArch},
++    syscall::io::{Io, Pio},
++};
++
++const REG_DEV_TABLE: usize = 0x00;
++const REG_CMD_BUF: usize = 0x08;
++const REG_EVENT_LOG: usize = 0x10;
++const REG_CONTROL: usize = 0x18;
++const REG_CMD_TAIL: usize = 0x2008;
++const CTRL_IOMMU_EN: u64 = 1 << 0;
++const CTRL_EVENT_LOG_EN: u64 = 1 << 2;
++const CTRL_CMD_BUF_EN: u64 = 1 << 12;
++/// 4 KiB buffers of 256 16-byte entries (length field = log2(256)).
++const BUF_LEN_256: u64 = 8 << 56;
++
++const DTE_V: u64 = 1 << 0;
++const DTE_TV: u64 = 1 << 1;
++const DTE_MODE_4LEVEL: u64 = 4 << 9;
++/// Read and write permission, the same bits in device table and page table entries.
++pub const IO_RW: u64 = (1 << 61) | (1 << 62);
++pub const IO_PRESENT: u64 = 1;
++
++struct Iommu {
++    mmio: usize,
++    dev_table: usize,
++    cmd: usize,
++    cmd_tail: usize,
++    /// One word the IOMMU writes when a COMPLETION_WAIT is reached.
++    sem: usize,
++    sem_pa: u64,
++}
++
++static IOMMU: Mutex<Option<Iommu>> = Mutex::new(None);
++static PCI_CONFIG: Mutex<()> = Mutex::new(());
++
++fn zeroed(order: u32) -> Option<(u64, usize)> {
++    let frame = allocate_p2frame(order, true)?;
++    Some((frame.base().data() as u64, RmmA::phys_to_virt(frame.base()).data()))
++}
++
++impl Iommu {
++    fn start() -> Option<Self> {
++        let ivrs = *find_sdt("IVRS").first()?;
++        let table = unsafe {
++            core::slice::from_raw_parts(ivrs as *const _ as *const u8, ivrs.length as usize)
++        };
++        // IVRS header (36) + IVinfo (4) + reserved (8), then IVHD/IVMD blocks.
++        let mut off = 48;
++        let base = loop {
++            let block = table.get(off..off + 24)?;
++            let len = u16::from_le_bytes([block[2], block[3]]) as usize;
++            if matches!(block[0], 0x10 | 0x11 | 0x40) {
++                break u64::from_le_bytes(block[8..16].try_into().ok()?);
++            }
++            off += len.max(4);
++        };
++        let mmio = unsafe { crate::memory::map_device_memory(PhysicalAddress::new(base as usize), 0x4000) }.data();
++        let (dev_table_pa, dev_table) = zeroed(9)?; // 65536 entries x 32 bytes = 2 MiB
++        let (cmd_pa, cmd) = zeroed(0)?;
++        let (log_pa, _) = zeroed(0)?;
++        let (sem_pa, sem) = zeroed(0)?;
++        let iommu = Iommu { mmio, dev_table, cmd, cmd_tail: 0, sem, sem_pa };
++        unsafe {
++            iommu.w64(REG_DEV_TABLE, dev_table_pa | 0x1FF); // size: (0x1FF + 1) x 4 KiB
++            iommu.w64(REG_CMD_BUF, cmd_pa | BUF_LEN_256);
++            iommu.w64(REG_EVENT_LOG, log_pa | BUF_LEN_256);
++            let ctrl = iommu.r64(REG_CONTROL);
++            iommu.w64(REG_CONTROL, ctrl | CTRL_CMD_BUF_EN | CTRL_EVENT_LOG_EN);
++            iommu.w64(REG_CONTROL, ctrl | CTRL_CMD_BUF_EN | CTRL_EVENT_LOG_EN | CTRL_IOMMU_EN);
++        }
++        info!("iskra-amd-vi: IOMMU at {:#x} enabled (all devices untranslated)", base);
++        Some(iommu)
++    }
++
++    unsafe fn r64(&self, reg: usize) -> u64 {
++        unsafe { read_volatile((self.mmio + reg) as *const u64) }
++    }
++    unsafe fn w64(&self, reg: usize, v: u64) {
++        unsafe { write_volatile((self.mmio + reg) as *mut u64, v) }
++    }
++
++    fn command(&mut self, c: [u32; 4]) {
++        unsafe {
++            let slot = (self.cmd + self.cmd_tail) as *mut u32;
++            for (i, w) in c.iter().enumerate() {
++                write_volatile(slot.add(i), *w);
++            }
++            self.cmd_tail = (self.cmd_tail + 16) % 4096;
++            self.w64(REG_CMD_TAIL, self.cmd_tail as u64);
++        }
++    }
++
++    /// Queue COMPLETION_WAIT and spin until the IOMMU has processed every earlier command.
++    fn wait(&mut self) -> bool {
++        unsafe { write_volatile(self.sem as *mut u64, 0) };
++        let lo = (self.sem_pa as u32 & !7) | 1; // store the data word when done
++        self.command([lo, (self.sem_pa >> 32) as u32 | (1 << 28), 1, 0]);
++        for _ in 0..10_000_000 {
++            if unsafe { read_volatile(self.sem as *const u64) } == 1 {
++                return true;
++            }
++            core::hint::spin_loop();
++        }
++        false
++    }
++
++    fn set_dte(&mut self, device: u16, entry: [u64; 4], domain: u16) -> bool {
++        unsafe {
++            let dte = (self.dev_table + device as usize * 32) as *mut u64;
++            for i in (1..4).rev() {
++                write_volatile(dte.add(i), entry[i]);
++            }
++            write_volatile(dte, entry[0]); // the valid bit last
++        }
++        self.command([device as u32, 2 << 28, 0, 0]); // INVALIDATE_DEVTAB_ENTRY
++        // INVALIDATE_IOMMU_PAGES for the whole domain (S=1, PDE=1, address all ones).
++        self.command([0, domain as u32 | (3 << 28), 0xFFFF_F000 | 3, 0x7FFF_FFFF]);
++        self.wait()
++    }
++}
++
++/// Point `device` (bus << 8 | dev << 3 | fn) at the I/O page table `root` in `domain`.
++pub fn attach(device: u16, root: u64, domain: u16) -> bool {
++    let mut guard = IOMMU.lock();
++    if guard.is_none() {
++        *guard = Iommu::start();
++    }
++    let Some(iommu) = guard.as_mut() else { return false };
++    let dte = [root | DTE_MODE_4LEVEL | DTE_TV | DTE_V | IO_RW, domain as u64, 0, 0];
++    iommu.set_dte(device, dte, domain)
++}
++
++/// Give `device` back to the host: invalid entry, untranslated DMA again.
++pub fn detach(device: u16, domain: u16) {
++    if let Some(iommu) = IOMMU.lock().as_mut() {
++        iommu.set_dte(device, [0; 4], domain);
++    }
++}
++
++/// Map `iova` -> `hpa` (4 KiB) in the 4-level I/O page table at `root`. `alloc` provides zeroed
++/// table frames (physical address) and must remember them for freeing.
++pub fn map_4k(root: u64, iova: u64, hpa: u64, mut alloc: impl FnMut() -> Option<u64>) -> Option<()> {
++    let mut table = root;
++    for level in (2..=4u64).rev() {
++        let shift = 12 + 9 * (level - 1);
++        let entry = virt(table + ((iova >> shift) & 0x1FF) * 8);
++        if unsafe { read_volatile(entry) } & IO_PRESENT == 0 {
++            let next = alloc()?;
++            unsafe { write_volatile(entry, next | ((level - 1) << 9) | IO_RW | IO_PRESENT) };
++        }
++        table = unsafe { read_volatile(entry) } & 0x000F_FFFF_FFFF_F000;
++    }
++    unsafe { write_volatile(virt(table + ((iova >> 12) & 0x1FF) * 8), hpa | IO_RW | IO_PRESENT) };
++    Some(())
++}
++
++fn virt(pa: u64) -> *mut u64 {
++    RmmA::phys_to_virt(PhysicalAddress::new(pa as usize)).data() as *mut u64
++}
++
++/// PCI configuration mechanism #1 (ports 0xCF8/0xCFC), aligned dwords.
++pub fn pci_read(device: u16, reg: u8) -> u32 {
++    let _guard = PCI_CONFIG.lock();
++    Pio::<u32>::new(0xCF8).write(0x8000_0000 | (device as u32) << 8 | (reg as u32 & 0xFC));
++    Pio::<u32>::new(0xCFC).read()
++}
++
++pub fn pci_write(device: u16, reg: u8, value: u32) {
++    let _guard = PCI_CONFIG.lock();
++    Pio::<u32>::new(0xCF8).write(0x8000_0000 | (device as u32) << 8 | (reg as u32 & 0xFC));
++    Pio::<u32>::new(0xCFC).write(value);
++}
+diff --git a/src/arch/x86_shared/mod.rs b/src/arch/x86_shared/mod.rs
+index efe5cca8..ecef59f5 100644
+--- a/src/arch/x86_shared/mod.rs
++++ b/src/arch/x86_shared/mod.rs
+@@ -28,6 +28,8 @@ pub mod start;
+ /// Iskra: AMD SVM bring-up self-test (hypervisor step 1)
+ #[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
+ pub mod svm;
++#[cfg(all(target_arch = "x86_64", feature = "iskra_svm_selftest"))]
++pub mod amd_vi;
+ 
+ /// Stop function
+ pub mod stop;
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+index bd8e92e7..c16d7376 100644
+--- a/src/arch/x86_shared/svm.rs
++++ b/src/arch/x86_shared/svm.rs
+@@ -605,6 +605,10 @@ pub struct Vm {
+     pending_irq: Option<u8>,
+     /// Guest x87/SSE state; VMRUN does not switch it, so it is swapped with the host's per run.
+     fpu: Box<FxArea>,
++    /// I/O permission map (12 KiB): a set bit makes the port exit to userspace.
++    iopm: u64,
++    /// PCI device given to this VM (bus << 8 | dev << 3 | fn) and the root of its I/O page table.
++    device: Option<(u16, u64)>,
+ }
+ 
+ // Only physical addresses and kernel-direct-map pointers inside; access is serialized by the scheme.
+@@ -654,9 +658,106 @@ impl Vm {
+             owned,
+             pending_irq: None,
+             fpu: Box::new(FxArea::reset()),
++            iopm,
++            device: None,
+         })
+     }
+ 
++    fn domain(&self) -> u16 {
++        // One device per VM, so the device names the domain: 1..=255 (0 unused; QEMU's AMD-Vi
++        // model also rejects DTEs with bit 8 set in the domain-ID word).
++        self.device.map_or(0, |(bdf, _)| bdf % 255 + 1)
++    }
++
++    /// Give PCI device `bdf` to this guest: its DMA goes through the IOMMU to the guest's RAM
++    /// (guest-physical addresses), and only there. Populate guest RAM first; pages added later are
++    /// mapped too.
++    pub fn assign_device(&mut self, bdf: u16) -> Option<()> {
++        if self.device.is_some() {
++            return None;
++        }
++        let root = allocate_frame(true)?;
++        self.owned.push((root, 0));
++        let root = root.base().data() as u64;
++        let pages: Vec<(u64, u64)> =
++            self.pages.iter().map(|(gpa, f)| (*gpa, f.base().data() as u64)).collect();
++        for (gpa, hpa) in pages {
++            self.io_map(root, gpa, hpa)?;
++        }
++        self.device = Some((bdf, root));
++        if !super::amd_vi::attach(bdf, root, self.domain()) {
++            self.device = None;
++            return None;
++        }
++        Some(())
++    }
++
++    fn io_map(&mut self, root: u64, gpa: u64, hpa: u64) -> Option<()> {
++        let owned = &mut self.owned;
++        super::amd_vi::map_4k(root, gpa, hpa, || {
++            let f = allocate_frame(true)?;
++            owned.push((f, 0));
++            Some(f.base().data() as u64)
++        })
++    }
++
++    /// Let the guest use host I/O ports `base..base + len` directly (no exits). Only inside an
++    /// I/O BAR of the assigned device.
++    pub fn allow_ports(&mut self, base: u64, len: u64) -> Option<()> {
++        let (bdf, _) = self.device?;
++        let inside_bar = (0..6).any(|i| {
++            let bar = super::amd_vi::pci_read(bdf, 0x10 + 4 * i);
++            bar & 1 == 1 && (bar & !3) as u64 == base
++        });
++        (inside_bar && len > 0 && len <= 256 && base + len <= 0x10000).then_some(())?;
++        let map = RmmA::phys_to_virt(PhysicalAddress::new(self.iopm as usize)).data() as *mut u8;
++        for port in base..base + len {
++            unsafe { *map.add(port as usize / 8) &= !(1 << (port % 8)) };
++        }
++        Some(())
++    }
++
++    /// Map the assigned device's memory BAR at host-physical `base` (`len` bytes) into the guest at
++    /// the same address, uncached, so the guest drives the device's registers directly.
++    pub fn map_mmio(&mut self, base: u64, len: u64) -> Option<()> {
++        let (bdf, _) = self.device?;
++        let is_bar = (0..6u8).any(|i| {
++            let lo = super::amd_vi::pci_read(bdf, 0x10 + 4 * i);
++            let hi = if lo & 0x7 == 0x4 && i < 5 { super::amd_vi::pci_read(bdf, 0x14 + 4 * i) } else { 0 };
++            lo & 1 == 0 && ((hi as u64) << 32 | (lo & !0xF) as u64) == base
++        });
++        let ok = is_bar && base != 0 && base % 4096 == 0 && len > 0 && len % 4096 == 0 && len <= 64 << 20;
++        ok.then_some(())?;
++        let (base, end) = (base, base.checked_add(len).filter(|e| *e <= VM_GPA_LIMIT)?);
++        for gpa in (base..end).step_by(4096) {
++            let mut table = self.npt;
++            for shift in [39, 30, 21] {
++                let entry = unsafe { virt(table).add(((gpa >> shift) & 0x1FF) as usize) };
++                if unsafe { *entry } & 1 == 0 {
++                    let next = allocate_frame(true)?;
++                    self.owned.push((next, 0));
++                    unsafe { *entry = next.base().data() as u64 | NPT_FLAGS };
++                }
++                table = unsafe { *entry } & 0x000F_FFFF_FFFF_F000;
++            }
++            // PCD | PWT: uncached, as device registers need.
++            unsafe { *virt(table).add(((gpa >> 12) & 0x1FF) as usize) = gpa | NPT_FLAGS | (1 << 4) | (1 << 3) };
++        }
++        Some(())
++    }
++
++    /// Configuration space of the assigned device (aligned dwords).
++    pub fn device_config(&self, reg: u8, write: Option<u32>) -> Option<u32> {
++        let (bdf, _) = self.device?;
++        match write {
++            Some(v) => {
++                super::amd_vi::pci_write(bdf, reg, v);
++                Some(v)
++            }
++            None => Some(super::amd_vi::pci_read(bdf, reg)),
++        }
++    }
++
+     /// Host frame backing guest page `gpa_page`, allocated and mapped on first use.
+     fn page(&mut self, gpa_page: u64) -> Option<*mut u8> {
+         if !self.pages.contains_key(&gpa_page) {
+@@ -674,6 +775,9 @@ impl Vm {
+             }
+             unsafe { *virt(table).add(((gpa_page >> 12) & 0x1FF) as usize) = hpa | NPT_FLAGS };
+             self.pages.insert(gpa_page, frame);
++            if let Some((_, root)) = self.device {
++                self.io_map(root, gpa_page, hpa)?;
++            }
+         }
+         let frame = *self.pages.get(&gpa_page)?;
+         Some(RmmA::phys_to_virt(frame.base()).data() as *mut u8)
+@@ -931,6 +1035,10 @@ impl Vm {
+ 
+ impl Drop for Vm {
+     fn drop(&mut self) {
++        // The device must stop using the I/O page table before its frames are freed.
++        if let Some((bdf, _)) = self.device {
++            super::amd_vi::detach(bdf, self.domain());
++        }
+         unsafe {
+             for (_, frame) in core::mem::take(&mut self.pages) {
+                 deallocate_frame(frame);
+diff --git a/src/scheme/sys/vmm.rs b/src/scheme/sys/vmm.rs
+index e5bea5fc..fa5aa446 100644
+--- a/src/scheme/sys/vmm.rs
++++ b/src/scheme/sys/vmm.rs
+@@ -9,6 +9,10 @@
+ //! | [`REGS`] (1 << 48)  | vCPU registers ([`VmRegs`])              | vCPU registers                |
+ //! | [`RUN`]  (REGS + 4 KiB) | -                                    | run until the next exit, returns [`VmExit`] |
+ //! | [`INJECT`] (REGS + 8 KiB) | interrupt vector (u64, 32-255) to deliver as soon as the guest can take it | - |
++//! | [`ASSIGN`] (REGS + 12 KiB) | PCI device (u64: bus << 8 \| dev << 3 \| fn) to give the guest; its DMA is remapped by the IOMMU to guest RAM | - |
++//! | [`PORTS`] (REGS + 16 KiB) | `[base, len]` (2 x u64): an I/O BAR of that device the guest may use directly | - |
++//! | [`MMIO`] (REGS + 20 KiB) | `[base, len]` (2 x u64): a memory BAR of that device, mapped into the guest at the same address | - |
++//! | [`DEVCFG`] + reg (REGS + 64 KiB) | u32 to the device's PCI config register | u32 from it |
+ //!
+ //! The kernel intercepts interrupts, every I/O port, every MSR, CPUID and HLT, so a guest never
+ //! reaches host hardware or host MSRs; userspace decides how to answer each exit. Closing the
+@@ -33,6 +37,10 @@ use super::{Handle, HANDLES};
+ pub const REGS: u64 = 1 << 48;
+ pub const RUN: u64 = REGS + 0x1000;
+ pub const INJECT: u64 = REGS + 0x2000;
++pub const ASSIGN: u64 = REGS + 0x3000;
++pub const PORTS: u64 = REGS + 0x4000;
++pub const MMIO: u64 = REGS + 0x5000;
++pub const DEVCFG: u64 = REGS + 0x10000;
+ /// Largest single memory read or write.
+ const MAX_IO: usize = 1 << 20;
+ 
+@@ -92,6 +100,10 @@ pub fn read(id: usize, buf: UserSliceWo, pos: u64, token: &mut CleanLockToken) -
+             let exit: VmExit = exit.ok_or(Error::new(ENODEV))?;
+             return buf.copy_common_bytes_from_slice(bytes_of(&exit));
+         }
++        if (DEVCFG..DEVCFG + 256).contains(&pos) && pos % 4 == 0 {
++            let v = with_vm(id, token, |vm| vm.device_config((pos - DEVCFG) as u8, None))?;
++            return buf.copy_common_bytes_from_slice(&v.ok_or(Error::new(ENODEV))?.to_ne_bytes());
++        }
+         if pos < VM_GPA_LIMIT {
+             let mut data = vec![0u8; buf.len().min(MAX_IO)];
+             with_vm(id, token, |vm| vm.read_mem(pos, &mut data))?;
+@@ -126,6 +138,28 @@ pub fn write(id: usize, buf: UserSliceRo, pos: u64, token: &mut CleanLockToken)
+             with_vm(id, token, |vm| vm.queue_interrupt(vector as u8))?;
+             return Ok(core::mem::size_of::<usize>());
+         }
++        if pos == ASSIGN {
++            let bdf = buf.read_usize()?;
++            let bdf = u16::try_from(bdf).map_err(|_| Error::new(EINVAL))?;
++            with_vm(id, token, |vm| vm.assign_device(bdf))?.ok_or(Error::new(ENODEV))?;
++            return Ok(core::mem::size_of::<usize>());
++        }
++        if pos == PORTS {
++            let [base, len]: [u64; 2] = unsafe { buf.read_exact()? };
++            with_vm(id, token, |vm| vm.allow_ports(base, len))?.ok_or(Error::new(EINVAL))?;
++            return Ok(16);
++        }
++        if pos == MMIO {
++            let [base, len]: [u64; 2] = unsafe { buf.read_exact()? };
++            with_vm(id, token, |vm| vm.map_mmio(base, len))?.ok_or(Error::new(EINVAL))?;
++            return Ok(16);
++        }
++        if (DEVCFG..DEVCFG + 256).contains(&pos) && pos % 4 == 0 {
++            let v = buf.read_u32()?;
++            with_vm(id, token, |vm| vm.device_config((pos - DEVCFG) as u8, Some(v)))?
++                .ok_or(Error::new(ENODEV))?;
++            return Ok(4);
++        }
+         if pos < VM_GPA_LIMIT {
+             let mut data = vec![0u8; buf.len().min(MAX_IO)];
+             let n = buf.copy_common_bytes_to_slice(&mut data)?;
+-- 
+2.43.0
+

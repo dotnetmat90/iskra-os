@@ -1,7 +1,7 @@
-From ffd5c1a36468fa22d64e2eda45293975ebe9b152 Mon Sep 17 00:00:00 2001
+From f1863fe47c4827a2fc15859245b88fad5ab91c4a Mon Sep 17 00:00:00 2001
 From: mattryznar <ryznarmat@gmail.com>
 Date: Fri, 27 Nov 2026 17:52:30 +0100
-Subject: [PATCH 6/7] Iskra: long mode and real-OS safety for vmm guests
+Subject: [PATCH 6/8] Iskra: long mode and real-OS safety for vmm guests
  (hypervisor step 6)
 
 - x87/SSE state swapped around VMRUN (FXSAVE/FXRSTOR), so guests cannot

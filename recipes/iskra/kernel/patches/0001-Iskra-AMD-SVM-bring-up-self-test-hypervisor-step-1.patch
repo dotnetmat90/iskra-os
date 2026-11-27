@@ -1,7 +1,7 @@
-From d5db278c6d5698c387c5cc303b818fd287211e95 Mon Sep 17 00:00:00 2001
+From 835997e12005557af3cd62ad7cd713f62b199777 Mon Sep 17 00:00:00 2001
 From: mattryznar <ryznarmat@gmail.com>
 Date: Fri, 27 Nov 2026 17:05:52 +0100
-Subject: [PATCH 1/7] Iskra: AMD SVM bring-up self-test (hypervisor step 1)
+Subject: [PATCH 1/8] Iskra: AMD SVM bring-up self-test (hypervisor step 1)
 
 At boot on the BSP, enable SVM, run a real-mode guest (mov ax,0x1234; hlt)
 with VMRUN and check for a HLT exit with AX=0x1234. Behind the

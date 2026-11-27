@@ -1,7 +1,7 @@
-From 1af3227fd28b8eaf40b9cceb0114e8b46079c0ab Mon Sep 17 00:00:00 2001
+From 6da64e9eb2ac9f5ba4545afe41b0e63a2a2ea0a7 Mon Sep 17 00:00:00 2001
 From: mattryznar <ryznarmat@gmail.com>
 Date: Fri, 27 Nov 2026 17:50:14 +0100
-Subject: [PATCH 5/7] Iskra: interrupt injection for vmm guests (hypervisor
+Subject: [PATCH 5/8] Iskra: interrupt injection for vmm guests (hypervisor
  step 5)
 
 /scheme/sys/vmm offset INJECT queues an external interrupt. The kernel injects
