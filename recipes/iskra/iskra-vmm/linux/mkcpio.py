@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Write a newc initramfs to stdout: /init (from argv[1]), /dev/console and /dev/kmsg nodes.
-Device nodes are written into the archive directly, so no root is needed."""
+"""Write a newc initramfs to stdout.
+
+    mkcpio.py INIT [BUSYBOX]
+
+INIT becomes /init (a static binary or a script for BusyBox). With BUSYBOX, /bin/busybox is
+added. Directories and /dev/console, /dev/kmsg, /dev/ttyS0 nodes are written into the archive
+directly, so no root is needed."""
 import sys
 
 def entry(name, mode, data=b"", rdev=(0, 0), ino=[0]):
@@ -11,12 +16,14 @@ def entry(name, mode, data=b"", rdev=(0, 0), ino=[0]):
     out += b"\0" * (-len(out) % 4) + data
     return out + b"\0" * (-len(out) % 4)
 
-init = open(sys.argv[1], "rb").read()
-archive = (
-    entry("dev", 0o040755)
-    + entry("dev/console", 0o020600, rdev=(5, 1))
-    + entry("dev/kmsg", 0o020644, rdev=(1, 11))
-    + entry("init", 0o100755, init)
-    + entry("TRAILER!!!", 0)
-)
+parts = [entry(d, 0o040755) for d in ("bin", "dev", "proc", "sys", "tmp", "root")]
+parts += [
+    entry("dev/console", 0o020600, rdev=(5, 1)),
+    entry("dev/kmsg", 0o020644, rdev=(1, 11)),
+    entry("dev/ttyS0", 0o020660, rdev=(4, 64)),
+    entry("init", 0o100755, open(sys.argv[1], "rb").read()),
+]
+if len(sys.argv) > 2:
+    parts.append(entry("bin/busybox", 0o100755, open(sys.argv[2], "rb").read()))
+archive = b"".join(parts) + entry("TRAILER!!!", 0)
 sys.stdout.buffer.write(archive + b"\0" * (-len(archive) % 512))

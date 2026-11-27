@@ -1,0 +1,18 @@
+#!/bin/busybox sh
+# /init of the interactive Linux guest: BusyBox userland, a shell on the serial console.
+/bin/busybox --install -s /bin
+export PATH=/bin HOME=/root
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+hostname linux-in-iskra
+cat <<'BANNER'
+
+  Linux is running in a virtual machine on Iskra's own hypervisor.
+  BusyBox shell. Leave with:  exit   (or Ctrl-D)
+
+BANNER
+# A session with ttyS0 as controlling terminal, so Ctrl-C works.
+setsid sh -c 'exec sh -l <>/dev/ttyS0 >&0 2>&1'
+echo "Shell exited; powering off the VM."
+poweroff -f

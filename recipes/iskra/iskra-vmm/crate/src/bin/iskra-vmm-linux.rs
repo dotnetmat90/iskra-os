@@ -1,18 +1,23 @@
 //! iskra-vmm-linux: boot a Linux kernel in a VM on Iskra's hypervisor (hypervisor step 7).
 //!
 //! A deliberately small VMM: 64-bit Linux boot protocol (bzImage + initramfs), 128 MiB of RAM,
-//! CPUID passthrough minus what it cannot provide, a 16550-like serial port for the console, an
-//! 8259 PIC and an 8254 PIT for the timer interrupt, CMOS clock registers, and "nothing here"
-//! (0xFF) for every other port. No PCI, no ACPI, no local APIC: the kernel command line tells
-//! Linux not to look for them. Must run as root.
+//! CPUID passthrough minus what it cannot provide, an 8250/16450 serial port wired to this
+//! terminal (input and output, with interrupts), an 8259 PIC and an 8254 PIT for the timer,
+//! CMOS clock registers, and "nothing here" (0xFF) for every other port. No PCI, no ACPI, no
+//! local APIC: the kernel command line tells Linux not to look for them. Must run as root.
+//!
+//! The default initramfs starts a BusyBox shell on the serial console; type `exit` to power the
+//! VM off. Input can also be piped in, e.g. `printf 'uname -a\nexit\n' | iskra-vmm-linux`.
 //!
 //! Usage: iskra-vmm-linux [bzImage] [initramfs] [extra kernel arguments...]
 
 use std::{
     arch::x86_64::{__cpuid_count, _rdtsc},
+    collections::VecDeque,
     env, fs,
-    io::{self, Write},
-    thread::sleep,
+    io::{self, Read, Write},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread::{self, sleep},
     time::{Duration, Instant},
 };
 
@@ -69,10 +74,24 @@ fn main() -> io::Result<()> {
     regs.gpr[6] = BOOT_PARAMS_AT; // rsi
     vm.set_regs(&regs)?;
 
+    // Terminal input arrives on its own thread so the VM never blocks on it.
+    let (input_tx, input) = mpsc::channel::<u8>();
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = stdin.read(&mut byte) {
+            if input_tx.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
     let mut m = Machine::new();
     let start = Instant::now();
     let mut exits: u64 = 0;
     loop {
+        m.take_input(&input);
+        m.deliver(&vm)?;
         let exit = vm.run()?;
         exits += 1;
         match exit.code {
@@ -120,15 +139,19 @@ fn main() -> io::Result<()> {
                     );
                     return Ok(());
                 }
-                // Idle: sleep until the next timer tick, then wake the guest with it.
+                // Idle: wait for the next timer tick or terminal input, whichever comes first.
                 r.rip += 1;
                 vm.set_regs(&r)?;
-                if let Some(wait) = m.until_tick() {
-                    sleep(wait);
+                if m.next_irq().is_none() {
+                    let wait = m.until_tick().unwrap_or(Duration::from_millis(100));
+                    match input.recv_timeout(wait) {
+                        Ok(byte) => m.staged.push_back(byte),
+                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+                    }
                 }
-                m.tick(&vm)?;
+                m.tick();
             }
-            EXIT_INTR => m.tick(&vm)?, // a host interrupt: deliver a timer tick if one is due
+            EXIT_INTR => m.tick(), // a host interrupt: a timer tick may be due
             EXIT_NPF => {
                 // Outside RAM: hardware Linux probes for but this VMM does not have. Back the page
                 // with 0xFF bytes, the PC convention for "no device here", and let it continue.
@@ -289,14 +312,21 @@ enum Icw {
 
 /// The emulated PC devices.
 struct Machine {
-    // 16550 UART at 0x3F8.
+    // 8250/16450 UART at 0x3F8, IRQ 4.
     ier: u8,
     lcr: u8,
     mcr: u8,
     scr: u8,
-    // 8259 PIC (master only; IRQ 0 is all this VMM raises).
+    rx: VecDeque<u8>,
+    /// Terminal input not yet handed to the UART (held until Linux enables receive interrupts,
+    /// since the 8250 driver flushes the receiver while it initializes).
+    staged: VecDeque<u8>,
+    /// Transmitter-empty interrupt pending (set after a write or when it gets enabled).
+    thre_pending: bool,
+    // 8259 PIC (master): vector base, mask, in-service bits.
     pic_base: u8,
     pic_mask: u8,
+    pic_isr: u8,
     /// Initialization bytes still expected on port 0x21 after ICW1, in order; empty = normal mode.
     pic_icw: Vec<Icw>,
     // 8254 PIT channel 0.
@@ -304,6 +334,7 @@ struct Machine {
     pit_lsb: Option<u8>,
     pit_since: Instant,
     next_tick: Option<Instant>,
+    timer_pending: bool,
     // CMOS index.
     cmos_index: u8,
     serial_line: Vec<u8>,
@@ -318,13 +349,18 @@ impl Machine {
             lcr: 0,
             mcr: 0,
             scr: 0,
+            rx: VecDeque::new(),
+            staged: VecDeque::new(),
+            thre_pending: false,
             pic_base: 0x08,
             pic_mask: 0xFF,
+            pic_isr: 0,
             pic_icw: Vec::new(),
             pit_reload: 0,
             pit_lsb: None,
             pit_since: Instant::now(),
             next_tick: None,
+            timer_pending: false,
             cmos_index: 0,
             serial_line: Vec::new(),
             ticks: 0,
@@ -341,12 +377,12 @@ impl Machine {
         self.next_tick.map(|t| t.saturating_duration_since(Instant::now()))
     }
 
-    /// Raise IRQ 0 if the PIT has fired and the PIC lets it through.
-    fn tick(&mut self, vm: &Vm) -> io::Result<()> {
-        let (Some(due), Some(period)) = (self.next_tick, self.tick_period()) else { return Ok(()) };
+    /// Mark IRQ 0 pending if the PIT has fired since the last tick.
+    fn tick(&mut self) {
+        let (Some(due), Some(period)) = (self.next_tick, self.tick_period()) else { return };
         let now = Instant::now();
         if now < due {
-            return Ok(());
+            return;
         }
         // Missed ticks collapse into one, like a real interrupt line.
         let mut next = due + period;
@@ -354,11 +390,54 @@ impl Machine {
             next += period;
         }
         self.next_tick = Some(next);
-        if self.pic_mask & 1 == 0 {
-            vm.inject(self.pic_base)?;
+        self.timer_pending = true;
+    }
+
+    /// Move terminal input into the UART once Linux listens for it.
+    fn take_input(&mut self, input: &Receiver<u8>) {
+        while let Ok(byte) = input.try_recv() {
+            self.staged.push_back(byte);
+        }
+        // Receive interrupts on and OUT2 (the PC's IRQ gate) set outside loopback: the driver is
+        // past its probe and FIFO flushes, so nothing typed is thrown away.
+        if self.ier & 0x01 != 0 && self.mcr & 0x18 == 0x08 {
+            self.rx.extend(self.staged.drain(..));
+        }
+    }
+
+    /// Serial interrupt identification: receive data first, then transmitter empty.
+    fn uart_irq(&self) -> Option<u8> {
+        if self.ier & 0x01 != 0 && !self.rx.is_empty() {
+            Some(0x04)
+        } else if self.ier & 0x02 != 0 && self.thre_pending {
+            Some(0x02)
+        } else {
+            None
+        }
+    }
+
+    /// The IRQ to inject next, if any: one at a time (the PIC has nothing in service, which also
+    /// matches the kernel's single pending-interrupt slot), timer before serial, masks respected.
+    fn next_irq(&self) -> Option<u8> {
+        if self.pic_isr != 0 {
+            None
+        } else if self.timer_pending && self.pic_mask & 0x01 == 0 {
+            Some(0)
+        } else if self.uart_irq().is_some() && self.pic_mask & 0x10 == 0 {
+            Some(4)
+        } else {
+            None
+        }
+    }
+
+    fn deliver(&mut self, vm: &Vm) -> io::Result<()> {
+        let Some(irq) = self.next_irq() else { return Ok(()) };
+        if irq == 0 {
+            self.timer_pending = false;
             self.ticks += 1;
         }
-        Ok(())
+        self.pic_isr |= 1 << irq;
+        vm.inject(self.pic_base + irq)
     }
 
     fn io(&mut self, vm: &Vm, exit: &iskra_vmm::Exit) -> io::Result<()> {
@@ -389,12 +468,19 @@ impl Machine {
 
     fn read(&mut self, port: u16) -> u8 {
         match port {
-            0x3F8 => 0,                                  // RBR: no input
-            0x3F9 => self.ier,
-            0x3FA => 0x01,                               // IIR: no interrupt pending
+            0x3F8 if self.lcr & 0x80 == 0 => self.rx.pop_front().unwrap_or(0), // RBR
+            0x3F9 if self.lcr & 0x80 == 0 => self.ier,
+            0x3FA => match self.uart_irq() {
+                Some(0x02) => {
+                    self.thre_pending = false; // reading IIR clears the THRE interrupt
+                    0x02
+                }
+                Some(id) => id,
+                None => 0x01,
+            },
             0x3FB => self.lcr,
             0x3FC => self.mcr,
-            0x3FD => 0x60,                               // LSR: transmitter empty
+            0x3FD => 0x60 | !self.rx.is_empty() as u8,   // LSR: THRE | TEMT, DR if data waits
             0x3FE if self.mcr & 0x10 != 0 => {
                 // Loopback: modem status mirrors the modem control lines (8250 autodetection).
                 let m = self.mcr;
@@ -402,7 +488,7 @@ impl Machine {
             }
             0x3FE => 0xB0,                               // MSR: DCD, DSR, CTS
             0x3FF => self.scr,
-            0x20 => 0,                                   // PIC IRR/ISR
+            0x20 => self.pic_isr,                        // PIC ISR (OCW3 read-select ignored)
             0x21 => self.pic_mask,
             0x40 => {
                 // PIT channel 0 counter, counting down from the reload value.
@@ -426,14 +512,22 @@ impl Machine {
             0x3F8 if self.lcr & 0x80 == 0 => {
                 // Console output, flushed per line so it interleaves well with the host terminal.
                 self.serial_line.push(v);
-                if v == b'\n' || self.serial_line.len() > 512 {
+                // Line-buffered while the kernel prints logs; once userspace drives the port with
+                // interrupts (a shell prompt has no newline), flush every byte.
+                if v == b'\n' || self.serial_line.len() > 512 || self.ier & 0x02 != 0 {
                     let mut out = io::stdout().lock();
                     out.write_all(&self.serial_line)?;
                     out.flush()?;
                     self.serial_line.clear();
                 }
+                self.thre_pending = true; // transmitted at once: the holding register is empty again
             }
-            0x3F9 if self.lcr & 0x80 == 0 => self.ier = v,
+            0x3F9 if self.lcr & 0x80 == 0 => {
+                if v & 0x02 != 0 && self.ier & 0x02 == 0 {
+                    self.thre_pending = true; // enabling THRE with an empty transmitter interrupts
+                }
+                self.ier = v & 0x0F;
+            }
             0x3FB => self.lcr = v,
             0x3FC => self.mcr = v,
             0x3FF => self.scr = v,
@@ -448,7 +542,15 @@ impl Machine {
                     self.pic_icw.push(Icw::Mode);
                 }
             }
-            0x20 => {} // OCW2/OCW3 (EOI etc.): no state needed here
+            0x20 if v & 0x18 == 0 && v & 0x20 != 0 => {
+                // OCW2 end of interrupt: specific (bit 6, IRQ in bits 0-2) or the highest in service.
+                if v & 0x40 != 0 {
+                    self.pic_isr &= !(1 << (v & 7));
+                } else {
+                    self.pic_isr &= self.pic_isr.wrapping_sub(1);
+                }
+            }
+            0x20 => {} // other OCW2/OCW3 commands need no state here
             0x21 if self.pic_icw.is_empty() => self.pic_mask = v,
             0x21 => {
                 if self.pic_icw.remove(0) == Icw::VectorBase {

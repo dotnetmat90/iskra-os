@@ -116,8 +116,12 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
      QEMU's SVM emulation), its `/init` prints a greeting and the guest halts; 420 timer ticks
      reach it. Bugs found on the way: the PIC init-sequence decoding in the VMM, and in the kernel,
      host interrupts stayed masked while a guest ran (fixed by setting IF inside the CLGI window).
-   - [ ] Next for Linux: interactive console (serial input and the THRE interrupt for tty output),
-     virtio block/network devices, more than one vCPU, a local APIC; or a QEMU accelerator backend
+   - [x] Interactive Linux: `iskra-vmm-linux` now boots a BusyBox shell (pinned busybox-static)
+     on the guest's serial port, wired to the terminal in both directions: receive and THRE
+     interrupts on IRQ 4, and the PIC tracks in-service IRQs and EOIs. Type `exit` to power off;
+     input can be piped (`printf 'uname -a\nexit\n' | iskra-vmm-linux`). The old greeting-only
+     initramfs stays as `/usr/share/iskra-vmm/initramfs-hello.cpio`.
+   - [ ] Next for Linux: virtio block/network devices, more than one vCPU, a local APIC; or a QEMU accelerator backend
      on `/scheme/sys/vmm` for full device support.
    - [ ] Later: IOMMU (AMD-Vi) and device passthrough to the Linux VM.
    - [ ] Not yet tried on real AMD hardware or under nested KVM on Proxmox.

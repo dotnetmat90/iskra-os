@@ -1,5 +1,5 @@
 # Iskra hypervisor userspace: minimal VMMs that drive /scheme/sys/vmm, plus a Linux guest
-# (Alpine's virt kernel, pinned by checksum, and a tiny initramfs built here).
+# (Alpine's virt kernel and static BusyBox, pinned by checksum; initramfs images built here).
 # Needs a kernel with Iskra's hypervisor patches (config/iskra-hv.toml).
 [build]
 template = "custom"
@@ -17,5 +17,15 @@ echo "${KERNEL_SHA256}  ${COOKBOOK_BUILD}/vmlinuz-virt" | sha256sum -c -
 cp "${COOKBOOK_BUILD}/vmlinuz-virt" "${SHARE}/vmlinuz"
 x86_64-unknown-redox-as "${COOKBOOK_RECIPE}/linux/init.S" -o "${COOKBOOK_BUILD}/init.o"
 x86_64-unknown-redox-ld -static -nostdlib -e _start "${COOKBOOK_BUILD}/init.o" -o "${COOKBOOK_BUILD}/init"
-python3 "${COOKBOOK_RECIPE}/linux/mkcpio.py" "${COOKBOOK_BUILD}/init" > "${SHARE}/initramfs.cpio"
+python3 "${COOKBOOK_RECIPE}/linux/mkcpio.py" "${COOKBOOK_BUILD}/init" > "${SHARE}/initramfs-hello.cpio"
+
+# Interactive guest: Alpine's static BusyBox, pinned by checksum.
+BUSYBOX_URL=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/busybox-static-1.37.0-r31.apk
+BUSYBOX_SHA256=b0d6cfc585d7fdd12df359cc5d38d5e45894e9e9e78c4059eb41577d022ec734
+curl -fsSL -o "${COOKBOOK_BUILD}/busybox-static.apk" "${BUSYBOX_URL}"
+echo "${BUSYBOX_SHA256}  ${COOKBOOK_BUILD}/busybox-static.apk" | sha256sum -c -
+mkdir -p "${COOKBOOK_BUILD}/busybox"
+tar xzf "${COOKBOOK_BUILD}/busybox-static.apk" -C "${COOKBOOK_BUILD}/busybox" 2>/dev/null || true
+python3 "${COOKBOOK_RECIPE}/linux/mkcpio.py" "${COOKBOOK_RECIPE}/linux/shell.init" \
+    "${COOKBOOK_BUILD}/busybox/bin/busybox.static" > "${SHARE}/initramfs.cpio"
 """
