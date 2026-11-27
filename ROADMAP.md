@@ -1,6 +1,6 @@
 # Iskra roadmap
 
-Revised 2026-11-27 (hypervisor step 1 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
+Revised 2026-11-27 (hypervisor steps 1–2 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
 The blueprint's vision stays: an OS built for AI agents, where the microkernel decides what an agent
 can see. Its 12-week schedule does not: it packs years of systems work (a hypervisor, IOMMU passthrough,
 a Linux driver VM, GPU gaming, power management) into weeks 5–12. This roadmap keeps the ambition but
@@ -82,8 +82,13 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
    - [x] **Step 1 done (2026-11-27):** the kernel enables SVM at boot, runs a real-mode guest
      (`mov ax, 0x1234; hlt`) with VMRUN and gets a HLT exit with AX = 0x1234; boot then continues
      normally. Verified in QEMU's SVM emulation (`ISKRA_CONFIG=iskra-hv ISKRA_QEMU_CPU=EPYC
-     ISKRA_BOOT_MARKER="iskra-svm: PASS" ./iskra.sh test`). Code: `recipes/iskra/kernel/`.
-   - [ ] Step 2: nested paging (NPT): guest-physical memory separate from host memory.
+     ISKRA_BOOT_MARKER="iskra-svm: nested paging: PASS" ./iskra.sh test`). Code: `recipes/iskra/kernel/`.
+   - [x] **Step 2 done (2026-11-27): nested paging.** A 32-bit paged guest runs in its own
+     guest-physical address space through 4-level nested page tables: its writes land in the
+     host frame behind its address, an unmapped address exits to the host as a nested page fault
+     with the right address, and after the host maps a page and resumes, the guest finishes with
+     the new data. (QEMU 8.2's SVM emulation skips nested paging for guests with paging off, so
+     the test guest runs with its own paging on, as Linux does.)
    - [ ] Step 3: I/O exits: the guest writes to a serial port and the host prints it.
    - [ ] Step 4: `/scheme/vmm` so userspace creates VMs, maps memory and runs vCPUs.
    - [ ] Not yet tried on real AMD hardware or under nested KVM on Proxmox.

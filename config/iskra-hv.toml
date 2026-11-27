@@ -1,7 +1,7 @@
 # Hypervisor development image: Iskra with the kernel built from local, patched source.
 #   recipes/iskra/kernel/prepare.sh      # puts the patched kernel at recipes/core/kernel/source
 #   ISKRA_CONFIG=iskra-hv ./iskra.sh build
-#   ISKRA_CONFIG=iskra-hv ISKRA_QEMU_CPU=EPYC ISKRA_BOOT_MARKER="iskra-svm: PASS" ./iskra.sh test
+#   ISKRA_CONFIG=iskra-hv ISKRA_QEMU_CPU=EPYC ISKRA_BOOT_MARKER="iskra-svm: nested paging: PASS" ./iskra.sh test
 # QEMU emulates AMD SVM for the EPYC model, so this works without virtualization hardware.
 # See ROADMAP.md, Phase 3.
 

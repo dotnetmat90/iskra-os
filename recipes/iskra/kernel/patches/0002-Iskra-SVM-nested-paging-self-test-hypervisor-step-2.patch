@@ -1,0 +1,440 @@
+From b771cc2104398753b276a05aff79d25c3862f375 Mon Sep 17 00:00:00 2001
+From: mattryznar <ryznarmat@gmail.com>
+Date: Fri, 27 Nov 2026 17:24:21 +0100
+Subject: [PATCH 2/2] Iskra: SVM nested paging self-test (hypervisor step 2)
+
+A 32-bit paged guest runs in its own guest-physical address space through
+4-level nested page tables. It writes guest memory the host can read back,
+faults to the host on an unmapped address (NPF exit for 0x5000), and after the
+host maps a page there and resumes, completes with the new value.
+---
+ src/arch/x86_shared/svm.rs | 351 +++++++++++++++++++++++++++----------
+ 1 file changed, 256 insertions(+), 95 deletions(-)
+
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+index 751ab590..b6af8c25 100644
+--- a/src/arch/x86_shared/svm.rs
++++ b/src/arch/x86_shared/svm.rs
+@@ -1,17 +1,23 @@
+-//! Iskra: AMD SVM (AMD-V) bring-up self-test.
++//! Iskra: AMD SVM (AMD-V) bring-up self-tests.
+ //!
+-//! Step 1 of Iskra's hypervisor work (ROADMAP.md, Phase 3). At boot, on the bootstrap CPU only,
+-//! enable SVM, build one VMCB for a tiny real-mode guest that runs `mov ax, 0x1234; hlt`, enter it
+-//! with VMRUN, and check that it comes back with a HLT exit and AX = 0x1234. This proves the core
+-//! path (EFER.SVME, host save area, VMCB layout, VMRUN, #VMEXIT) before any scheme or VMM exists.
++//! Iskra's hypervisor work (ROADMAP.md, Phase 3), proved step by step at boot on the bootstrap
++//! CPU before any /scheme/vmm exists:
+ //!
+-//! No nested paging yet: with guest paging off and NPT off, guest-physical equals host-physical,
+-//! so the guest's code page is just a host frame. VMCB offsets follow FreeBSD's
+-//! sys/amd64/vmm/amd/vmcb.h (bhyve, BSD-2-Clause) and the AMD APM vol. 2, appendix B.
++//! 1. `test_direct`: a real-mode guest runs `mov ax, 0x1234; hlt` straight in host memory (no
++//!    nested paging) and must exit on HLT with AX = 0x1234. Proves EFER.SVME, the host save area,
++//!    the VMCB layout, VMRUN and #VMEXIT.
++//! 2. `test_nested_paging`: a 32-bit paged guest gets its own physical address space through
++//!    nested page tables. It writes 0x1234 to its address 0x100 (the host must find it in the
++//!    backing frame),
++//!    then reads unmapped address 0x5000, which must exit with a nested page fault for 0x5000. The
++//!    host maps a page holding 0xBEEF there and resumes; the guest must finish with AX = 0xBEEF.
++//!    Proves NPT, NPF exits and resuming a guest after an exit (demand mapping).
+ //!
+-//! ponytail: three frames are leaked (VMCB, host save area, guest code) and SVM stays enabled in
+-//! EFER after the test; fine for a one-shot boot self-test, replace with a real vCPU lifecycle
+-//! once there is a /scheme/vmm.
++//! VMCB offsets follow FreeBSD's sys/amd64/vmm/amd/vmcb.h (bhyve, BSD-2-Clause) and the AMD APM
++//! vol. 2, appendix B.
++//!
++//! ponytail: frames are leaked and SVM stays enabled in EFER after the tests; fine for one-shot
++//! boot self-tests, replace with a real VM/vCPU lifecycle once /scheme/vmm exists.
+ 
+ use core::arch::{asm, x86_64::__cpuid};
+ 
+@@ -32,10 +38,14 @@ const CTRL_TLB_CTRL: usize = 0x05C;
+ const CTRL_EXITCODE: usize = 0x070;
+ const CTRL_EXITINFO1: usize = 0x078;
+ const CTRL_EXITINFO2: usize = 0x080;
++const CTRL_NP_ENABLE: usize = 0x090;
++const CTRL_N_CR3: usize = 0x0B0;
+ const INTCPT_HLT: u32 = 1 << 24;
+ const INTCPT_SHUTDOWN: u32 = 1 << 31;
+ const INTCPT_VMRUN: u32 = 1 << 0; // architecturally required
+ const EXIT_HLT: u64 = 0x78;
++const EXIT_NPF: u64 = 0x400;
++const EXIT_INVALID: u64 = u64::MAX;
+ 
+ // VMCB state save area (0x400 + offset in FreeBSD's struct vmcb_state).
+ const STATE: usize = 0x400;
+@@ -62,24 +72,26 @@ const STATE_RSP: usize = STATE + 0x1D8;
+ const STATE_RAX: usize = STATE + 0x1F8;
+ const STATE_G_PAT: usize = STATE + 0x268;
+ 
+-/// Guest: real mode, `mov ax, 0x1234` (B8 34 12) then `hlt` (F4).
+-const GUEST_CODE: [u8; 4] = [0xB8, 0x34, 0x12, 0xF4];
+-const GUEST_AX: u64 = 0x1234;
++/// Nested page table entry flags. Nested walks count as user accesses, so U must be set too.
++const NPT_FLAGS: u64 = 0x7; // present | writable | user
+ 
+-struct Vmcb(*mut u8);
++struct Vmcb {
++    pa: u64,
++    va: *mut u8,
++}
+ 
+ impl Vmcb {
+     unsafe fn w16(&self, off: usize, v: u16) {
+-        unsafe { self.0.add(off).cast::<u16>().write_unaligned(v) }
++        unsafe { self.va.add(off).cast::<u16>().write_unaligned(v) }
+     }
+     unsafe fn w32(&self, off: usize, v: u32) {
+-        unsafe { self.0.add(off).cast::<u32>().write_unaligned(v) }
++        unsafe { self.va.add(off).cast::<u32>().write_unaligned(v) }
+     }
+     unsafe fn w64(&self, off: usize, v: u64) {
+-        unsafe { self.0.add(off).cast::<u64>().write_unaligned(v) }
++        unsafe { self.va.add(off).cast::<u64>().write_unaligned(v) }
+     }
+     unsafe fn r64(&self, off: usize) -> u64 {
+-        unsafe { self.0.add(off).cast::<u64>().read_unaligned() }
++        unsafe { self.va.add(off).cast::<u64>().read_unaligned() }
+     }
+     /// Segment register in VMCB format: selector, 12-bit attributes, limit, base.
+     unsafe fn seg(&self, off: usize, selector: u16, attrib: u16, limit: u32, base: u64) {
+@@ -90,6 +102,82 @@ impl Vmcb {
+             self.w64(off + 8, base);
+         }
+     }
++
++    /// A fresh VMCB for a 16-bit real-mode guest whose code starts at CS:IP = 0:0, with CS
++    /// based at `cs_base` (a host address without NPT, a guest address with it).
++    fn real_mode(cs_base: u64) -> Option<Self> {
++        let (pa, va) = zeroed_page()?;
++        let v = Vmcb { pa, va };
++        unsafe {
++            // Control: exit on every exception, on HLT and on shutdown (triple fault).
++            v.w32(CTRL_EXC_INTERCEPT, 0xFFFF_FFFF);
++            v.w32(CTRL_INST1_INTERCEPT, INTCPT_HLT | INTCPT_SHUTDOWN);
++            v.w32(CTRL_INST2_INTERCEPT, INTCPT_VMRUN);
++            v.w32(CTRL_ASID, 1);
++            v.w32(CTRL_TLB_CTRL, 1); // flush entire TLB on every VMRUN
++
++            const CODE: u16 = 0x009B; // present, S, type 0xB (execute/read, accessed)
++            const DATA: u16 = 0x0093; // present, S, type 0x3 (read/write, accessed)
++            v.seg(SEG_CS, 0, CODE, 0xFFFF, cs_base);
++            for off in [SEG_ES, SEG_SS, SEG_DS, SEG_FS, SEG_GS] {
++                v.seg(off, 0, DATA, 0xFFFF, 0);
++            }
++            v.seg(SEG_GDTR, 0, 0, 0xFFFF, 0);
++            v.seg(SEG_IDTR, 0, 0, 0xFFFF, 0);
++            v.seg(SEG_LDTR, 0, 0x0082, 0xFFFF, 0); // present, LDT
++            v.seg(SEG_TR, 0, 0x008B, 0xFFFF, 0); // present, busy TSS
++            *v.va.add(STATE_CPL) = 0;
++            v.w64(STATE_EFER, EFER_SVME); // VMRUN requires guest EFER.SVME
++            v.w64(STATE_CR0, 0x10); // ET; protection and paging off
++            v.w64(STATE_CR3, 0);
++            v.w64(STATE_CR4, 0);
++            v.w64(STATE_DR6, 0xFFFF_0FF0);
++            v.w64(STATE_DR7, 0x400);
++            v.w64(STATE_RFLAGS, 0x2);
++            v.w64(STATE_RIP, 0);
++            v.w64(STATE_RSP, 0);
++            v.w64(STATE_RAX, 0);
++            v.w64(STATE_G_PAT, 0x0007_0406_0007_0406);
++        }
++        Some(v)
++    }
++
++    /// Enter the guest until its next #VMEXIT; return the exit code.
++    fn run(&self) -> u64 {
++        unsafe {
++            // GIF cleared around VMRUN so no host interrupt lands mid-switch. The guest shares the
++            // host's general registers except RAX/RSP (saved by VMRUN); these test guests only
++            // write AX, so the others are marked clobbered as a precaution.
++            asm!(
++                "clgi",
++                "vmrun rax",
++                "stgi",
++                inout("rax") self.pa => _,
++                out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
++                out("r8") _, out("r9") _, out("r10") _, out("r11") _,
++                out("r12") _, out("r13") _, out("r14") _, out("r15") _,
++            );
++            self.r64(CTRL_EXITCODE)
++        }
++    }
++
++    fn log_exit(&self, test: &str) {
++        unsafe {
++            info!(
++                "iskra-svm: {}: #VMEXIT code {:#x} info1 {:#x} info2 {:#x}, guest rip {:#x} ax {:#x}",
++                test,
++                self.r64(CTRL_EXITCODE),
++                self.r64(CTRL_EXITINFO1),
++                self.r64(CTRL_EXITINFO2),
++                self.r64(STATE_RIP),
++                self.r64(STATE_RAX) & 0xFFFF
++            );
++        }
++    }
++
++    fn ax(&self) -> u64 {
++        unsafe { self.r64(STATE_RAX) & 0xFFFF }
++    }
+ }
+ 
+ fn svm_supported() -> Result<(), &'static str> {
+@@ -103,6 +191,10 @@ fn svm_supported() -> Result<(), &'static str> {
+     Ok(())
+ }
+ 
++fn npt_supported() -> bool {
++    __cpuid(0x8000_000A).edx & 1 != 0
++}
++
+ /// Allocate a zeroed frame; return its physical address and kernel-virtual pointer.
+ fn zeroed_page() -> Option<(u64, *mut u8)> {
+     let frame = allocate_frame(true)?;
+@@ -111,95 +203,164 @@ fn zeroed_page() -> Option<(u64, *mut u8)> {
+     Some((phys.data() as u64, virt))
+ }
+ 
++fn virt(pa: u64) -> *mut u64 {
++    RmmA::phys_to_virt(crate::memory::PhysicalAddress::new(pa as usize)).data() as *mut u64
++}
++
++/// Four-level nested page table (same format as x86-64 long-mode paging), 4 KiB pages only.
++struct NestedPageTable {
++    pml4: u64,
++}
++
++impl NestedPageTable {
++    fn new() -> Option<Self> {
++        Some(Self { pml4: zeroed_page()?.0 })
++    }
++
++    /// Map guest-physical `gpa` to host-physical `hpa`, allocating intermediate tables.
++    fn map_4k(&self, gpa: u64, hpa: u64) -> Option<()> {
++        let mut table = self.pml4;
++        for shift in [39, 30, 21] {
++            let entry = unsafe { virt(table).add(((gpa >> shift) & 0x1FF) as usize) };
++            if unsafe { *entry } & 1 == 0 {
++                let (next, _) = zeroed_page()?;
++                unsafe { *entry = next | NPT_FLAGS };
++            }
++            table = unsafe { *entry } & 0x000F_FFFF_FFFF_F000;
++        }
++        unsafe { *virt(table).add(((gpa >> 12) & 0x1FF) as usize) = hpa | NPT_FLAGS };
++        Some(())
++    }
++}
++
+ pub fn selftest() {
+     if let Err(why) = svm_supported() {
+         info!("iskra-svm: skipped: {}", why);
+         return;
+     }
+-    if let Err(why) = run_guest() {
+-        error!("iskra-svm: FAIL: {}", why);
++    let Some((hsave_pa, _)) = zeroed_page() else {
++        error!("iskra-svm: FAIL: no frame for host save area");
++        return;
++    };
++    unsafe {
++        let efer = x86::msr::rdmsr(MSR_EFER);
++        x86::msr::wrmsr(MSR_EFER, efer | EFER_SVME);
++        x86::msr::wrmsr(MSR_VM_HSAVE_PA, hsave_pa);
++    }
++
++    let direct = test_direct();
++    report("direct", &direct);
++    if !npt_supported() {
++        info!("iskra-svm: nested paging: skipped: CPU has no NPT (CPUID 8000_000Ah EDX bit 0)");
++    } else {
++        report("nested paging", &test_nested_paging());
++    }
++}
++
++fn report(test: &str, result: &Result<(), &'static str>) {
++    match result {
++        Ok(()) => {
++            info!("iskra-svm: {}: PASS", test);
++        }
++        Err(why) => {
++            error!("iskra-svm: {}: FAIL: {}", test, why);
++        }
++    }
++}
++
++fn explain(exitcode: u64) -> &'static str {
++    if exitcode == EXIT_INVALID {
++        "VMRUN rejected the VMCB (VMEXIT_INVALID): guest state failed a consistency check"
++    } else {
++        "unexpected exit"
+     }
+ }
+ 
+-fn run_guest() -> Result<(), &'static str> {
+-    let (hsave_pa, _) = zeroed_page().ok_or("no frame for host save area")?;
+-    let (vmcb_pa, vmcb_va) = zeroed_page().ok_or("no frame for VMCB")?;
++/// Step 1: guest runs in host memory, `mov ax, 0x1234; hlt`.
++fn test_direct() -> Result<(), &'static str> {
++    const CODE: [u8; 4] = [0xB8, 0x34, 0x12, 0xF4];
+     let (code_pa, code_va) = zeroed_page().ok_or("no frame for guest code")?;
++    unsafe { core::ptr::copy_nonoverlapping(CODE.as_ptr(), code_va, CODE.len()) };
+ 
+-    unsafe {
+-        core::ptr::copy_nonoverlapping(GUEST_CODE.as_ptr(), code_va, GUEST_CODE.len());
++    let v = Vmcb::real_mode(code_pa).ok_or("no frame for VMCB")?;
++    let exit = v.run();
++    v.log_exit("direct");
++    if exit == EXIT_HLT && v.ax() == 0x1234 {
++        Ok(())
++    } else {
++        Err(explain(exit))
++    }
++}
+ 
+-        let efer = x86::msr::rdmsr(MSR_EFER);
+-        x86::msr::wrmsr(MSR_EFER, efer | EFER_SVME);
+-        x86::msr::wrmsr(MSR_VM_HSAVE_PA, hsave_pa);
++/// Step 2: guest in its own address space via nested paging, with demand mapping.
++fn test_nested_paging() -> Result<(), &'static str> {
++    // A 32-bit protected-mode guest with its own paging on (one 4 MiB identity page), so every
++    // access goes guest-linear -> guest-physical (guest tables) -> host-physical (nested tables),
++    // as in a real VM. (QEMU 8.2's SVM emulation skips nested paging for guests with paging off,
++    // which made a real-mode version of this test run host memory.)
++    //
++    // Guest-physical layout: 0x0000 code + data, 0x1000 guest page directory, 0x5000 unmapped.
++    //   0: B8 34 12 00 00   mov eax, 0x1234
++    //   5: A3 00 01 00 00   mov [0x100], eax
++    //  10: A1 00 50 00 00   mov eax, [0x5000]   -> nested page fault until the host maps it
++    //  15: F4               hlt
++    const CODE: [u8; 16] = [
++        0xB8, 0x34, 0x12, 0x00, 0x00, 0xA3, 0x00, 0x01, 0x00, 0x00, 0xA1, 0x00, 0x50, 0x00, 0x00,
++        0xF4,
++    ];
++    const GUEST_PD: u64 = 0x1000;
++    const LATE_GPA: u64 = 0x5000;
++
++    let npt = NestedPageTable::new().ok_or("no frame for nested PML4")?;
++    let (page0_pa, page0_va) = zeroed_page().ok_or("no frame for guest page 0")?;
++    let (pd_pa, pd_va) = zeroed_page().ok_or("no frame for guest page directory")?;
++    unsafe {
++        core::ptr::copy_nonoverlapping(CODE.as_ptr(), page0_va, CODE.len());
++        // PDE 0: 4 MiB page at guest-physical 0, present | writable | page size.
++        pd_va.cast::<u32>().write_unaligned(0x0000_0083);
++    }
++    npt.map_4k(0, page0_pa).ok_or("no frame for nested page tables")?;
++    npt.map_4k(GUEST_PD, pd_pa).ok_or("no frame for nested page tables")?;
+ 
+-        let v = Vmcb(vmcb_va);
+-        // Control: exit on every exception, on HLT and on shutdown (triple fault).
+-        v.w32(CTRL_EXC_INTERCEPT, 0xFFFF_FFFF);
+-        v.w32(CTRL_INST1_INTERCEPT, INTCPT_HLT | INTCPT_SHUTDOWN);
+-        v.w32(CTRL_INST2_INTERCEPT, INTCPT_VMRUN);
+-        v.w32(CTRL_ASID, 1);
+-        v.w32(CTRL_TLB_CTRL, 1); // flush entire TLB on this VMRUN
+-
+-        // Guest state: real mode, CS based at the code frame so CS:IP 0:0 is its first byte.
+-        const CODE: u16 = 0x009B; // present, S, type 0xB (execute/read, accessed)
+-        const DATA: u16 = 0x0093; // present, S, type 0x3 (read/write, accessed)
+-        v.seg(SEG_CS, 0, CODE, 0xFFFF, code_pa);
++    let v = Vmcb::real_mode(0).ok_or("no frame for VMCB")?;
++    unsafe {
++        const CODE32: u16 = 0x0C9B; // G, D, present, S, type 0xB
++        const DATA32: u16 = 0x0C93; // G, B, present, S, type 0x3
++        v.seg(SEG_CS, 0x08, CODE32, 0xFFFF_FFFF, 0);
+         for off in [SEG_ES, SEG_SS, SEG_DS, SEG_FS, SEG_GS] {
+-            v.seg(off, 0, DATA, 0xFFFF, 0);
+-        }
+-        v.seg(SEG_GDTR, 0, 0, 0xFFFF, 0);
+-        v.seg(SEG_IDTR, 0, 0, 0xFFFF, 0);
+-        v.seg(SEG_LDTR, 0, 0x0082, 0xFFFF, 0); // present, LDT
+-        v.seg(SEG_TR, 0, 0x008B, 0xFFFF, 0); // present, busy TSS
+-        *v.0.add(STATE_CPL) = 0;
+-        v.w64(STATE_EFER, EFER_SVME); // VMRUN requires guest EFER.SVME
+-        v.w64(STATE_CR0, 0x10); // ET; protection and paging off
+-        v.w64(STATE_CR3, 0);
+-        v.w64(STATE_CR4, 0);
+-        v.w64(STATE_DR6, 0xFFFF_0FF0);
+-        v.w64(STATE_DR7, 0x400);
+-        v.w64(STATE_RFLAGS, 0x2);
+-        v.w64(STATE_RIP, 0);
+-        v.w64(STATE_RSP, 0);
+-        v.w64(STATE_RAX, 0);
+-        v.w64(STATE_G_PAT, 0x0007_0406_0007_0406);
+-
+-        info!(
+-            "iskra-svm: VMRUN real-mode guest (vmcb {:#x}, code {:#x})",
+-            vmcb_pa, code_pa
+-        );
+-        // GIF cleared around VMRUN so no host interrupt lands mid-switch. The guest shares the
+-        // host's general registers except RAX/RSP (saved by VMRUN); it only writes AX, so the
+-        // others are marked clobbered as a precaution.
+-        asm!(
+-            "clgi",
+-            "vmrun rax",
+-            "stgi",
+-            inout("rax") vmcb_pa => _,
+-            out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
+-            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+-            out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+-        );
+-
+-        let exitcode = v.r64(CTRL_EXITCODE);
+-        let rip = v.r64(STATE_RIP);
+-        let ax = v.r64(STATE_RAX) & 0xFFFF;
+-        info!(
+-            "iskra-svm: #VMEXIT code {:#x} info1 {:#x} info2 {:#x}, guest rip {:#x} ax {:#x}",
+-            exitcode,
+-            v.r64(CTRL_EXITINFO1),
+-            v.r64(CTRL_EXITINFO2),
+-            rip,
+-            ax
+-        );
+-        if exitcode == EXIT_HLT && ax == GUEST_AX {
+-            info!("iskra-svm: PASS: guest ran and exited on HLT");
+-            Ok(())
+-        } else if exitcode == u64::MAX {
+-            Err("VMRUN rejected the VMCB (VMEXIT_INVALID): guest state failed a consistency check")
+-        } else {
+-            Err("unexpected exit")
++            v.seg(off, 0x10, DATA32, 0xFFFF_FFFF, 0);
+         }
++        v.w64(STATE_CR0, 0x8000_0011); // PG | ET | PE
++        v.w64(STATE_CR3, GUEST_PD);
++        v.w64(STATE_CR4, 0x10); // PSE: 4 MiB pages
++        v.w64(CTRL_NP_ENABLE, 1);
++        v.w64(CTRL_N_CR3, npt.pml4);
++    }
++
++    // Run 1: the read of 0x5000 must fault to the host.
++    let exit = v.run();
++    v.log_exit("nested paging, run 1");
++    if exit != EXIT_NPF {
++        return Err(explain(exit));
++    }
++    if unsafe { v.r64(CTRL_EXITINFO2) } != LATE_GPA {
++        return Err("nested page fault for the wrong guest address");
++    }
++    let written = unsafe { page0_va.add(0x100).cast::<u16>().read_unaligned() };
++    if written != 0x1234 {
++        return Err("guest write to its address 0x100 did not land in the backing frame");
++    }
++
++    // Map 0x5000 to a page holding 0xBEEF and resume: the faulting read is retried.
++    let (late_pa, late_va) = zeroed_page().ok_or("no frame for late page")?;
++    unsafe { late_va.cast::<u16>().write_unaligned(0xBEEF) };
++    npt.map_4k(LATE_GPA, late_pa).ok_or("no frame for nested page tables")?;
++
++    let exit = v.run();
++    v.log_exit("nested paging, run 2");
++    if exit == EXIT_HLT && v.ax() == 0xBEEF {
++        Ok(())
++    } else {
++        Err(explain(exit))
+     }
+ }
+-- 
+2.43.0
+
