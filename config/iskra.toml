@@ -16,6 +16,18 @@ webkitgtk3 = {}
 orbdata = "source"
 # Iskra's own tools: `ai` (ask any AI provider from the terminal). Local recipe, always built here.
 iskra-tools = "source"
+# Iskra's GUI (DESIGN.md): Inter font, greeter, panel and command bar.
+font-inter = "source"
+iskra-shell = "source"
+
+# Start Orbital with Iskra's greeter and panel instead of orblogin and launcher
+# (overrides config/desktop-minimal.toml).
+[[files]]
+path = "/usr/lib/init.d/20_orbital"
+data = """
+requires_weak 10_net.target 20_audiod.service
+nowait VT=3 orbital iskra-greeter iskra-panel
+"""
 
 [[files]]
 path = "/etc/hostname"

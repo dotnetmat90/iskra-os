@@ -23,6 +23,7 @@ Patches to code outside this repository (kept in `recipes/iskra/<name>/patches/`
 Iskra-only files: `ISKRA.md`, `PATCHES.md`, `iskra.sh`, `config/iskra.toml`, and `branding/`:
 
 - `branding/share/` mirrors `/usr/share/`; every file in it replaces upstream's.
-- `branding/synthwave.sh` renders the wallpaper and login art with ImageMagick 7.
+- `branding/wallpaper.sh` renders the default wallpaper (DESIGN.md: navy, indigo, plum, soft glows) with ImageMagick 7.
+- `branding/synthwave.sh` (old look, no longer the default) renders the synthwave wallpaper and login art with ImageMagick 7.
 - `branding/shots.py` boots the image headless and saves screenshots (login, desktop, and any keyboard/mouse steps you pass).
-- `recipes/iskra/`: `iskra-tools` (the `ai` command), `kernel` (hypervisor patches, `prepare.sh`), `iskra-vmm` (userspace VMMs: `iskra-vmm-hello`, `-timer`, `-long`, `-linux`, plus the Linux guest's initramfs sources) and `xfwl4` (experiment, see `config/iskra-xfwl4.toml`).
+- `recipes/iskra/`: `font-inter` (Inter, the UI font), `iskra-shell` (`iskra-greeter` login screen and `iskra-panel` floating panel + Super+Space command bar, replacing orblogin and launcher via `/usr/lib/init.d/20_orbital` in `config/iskra.toml`; see DESIGN.md), `iskra-tools` (the `ai` command), `kernel` (hypervisor patches, `prepare.sh`), `iskra-vmm` (userspace VMMs: `iskra-vmm-hello`, `-timer`, `-long`, `-linux`, plus the Linux guest's initramfs sources) and `xfwl4` (experiment, see `config/iskra-xfwl4.toml`).

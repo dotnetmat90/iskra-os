@@ -1,0 +1,23 @@
+# Inter, Iskra's UI font (SIL Open Font License 1.1). Static TTFs, because orbfont (rusttype)
+# has no variable-font support. Installs to /usr/share/fonts/Sans/Inter/.
+[package]
+description = "Inter font family"
+
+[build]
+template = "custom"
+script = """
+URL=https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+SHA256=9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e
+curl -fsSL -o "${COOKBOOK_BUILD}/inter.zip" "${URL}"
+echo "${SHA256}  ${COOKBOOK_BUILD}/inter.zip" | sha256sum -c -
+DEST="${COOKBOOK_STAGE}/usr/share/fonts/Sans/Inter"
+mkdir -p "${DEST}"
+python3 -c '
+import sys, zipfile, os
+z = zipfile.ZipFile(sys.argv[1])
+for n in z.namelist():
+    b = os.path.basename(n)
+    if (n.startswith("extras/ttf/Inter") and b.endswith(".ttf") and "Italic" not in b) or b == "LICENSE.txt":
+        open(os.path.join(sys.argv[2], b), "wb").write(z.read(n))
+' "${COOKBOOK_BUILD}/inter.zip" "${DEST}"
+"""

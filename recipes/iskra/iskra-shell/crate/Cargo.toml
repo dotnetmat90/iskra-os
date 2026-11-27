@@ -1,0 +1,28 @@
+[package]
+name = "iskra-shell"
+version = "0.1.0"
+edition = "2021"
+description = "Iskra desktop shell on Orbital: greeter, floating panel, command bar"
+license = "MIT"
+
+[[bin]]
+name = "iskra-greeter"
+path = "src/greeter.rs"
+
+[[bin]]
+name = "iskra-panel"
+path = "src/panel.rs"
+
+[dependencies]
+orbclient = { version = "0.4.4", features = ["image"] }
+orbfont = "0.4"
+redox_users = "0.4"
+redox_event = "0.4.8"
+libredox = { version = "0.1.18", default-features = false, features = ["std", "call", "mkns"] }
+redox_syscall = "0.9.0"
+ioslice = "0.6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = 3

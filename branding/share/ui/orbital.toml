@@ -9,9 +9,9 @@ window_max_unfocused = "/usr/share/ui/window_max_unfocused.png"
 window_close = "/usr/share/ui/window_close.png"
 window_close_unfocused = "/usr/share/ui/window_close_unfocused.png"
 
-# Iskra synthwave palette. Colours are 0xAARRGGBB.
-background_color = { data = 0xFF0B0221 }      # behind the wallpaper
-bar_color = { data = 0xE61A0B2E }             # title bar, unfocused window
-bar_highlight_color = { data = 0xF04A1270 }   # title bar, focused window
-text_color = { data = 0xFFB9A8D9 }            # title text, unfocused
-text_highlight_color = { data = 0xFF7EF9FF }  # title text, focused
+# Iskra palette (DESIGN.md): neutral dark glass, white text. Colours are 0xAARRGGBB.
+background_color = { data = 0xFF0D1326 }      # behind the wallpaper
+bar_color = { data = 0xD9181B24 }             # title bar, unfocused window
+bar_highlight_color = { data = 0xE6262A36 }   # title bar, focused window
+text_color = { data = 0xFFA9ADB8 }            # title text, unfocused
+text_highlight_color = { data = 0xFFFFFFFF }  # title text, focused
