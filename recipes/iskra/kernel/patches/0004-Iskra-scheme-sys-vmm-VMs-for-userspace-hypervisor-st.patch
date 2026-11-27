@@ -1,7 +1,7 @@
 From 575dd2e3a7a95718997495b1f5c5533ceb6c6206 Mon Sep 17 00:00:00 2001
 From: mattryznar <ryznarmat@gmail.com>
 Date: Fri, 27 Nov 2026 17:42:51 +0100
-Subject: [PATCH 4/5] Iskra: /scheme/sys/vmm, VMs for userspace (hypervisor
+Subject: [PATCH 4/6] Iskra: /scheme/sys/vmm, VMs for userspace (hypervisor
  step 4)
 
 Opening /scheme/sys/vmm (root) creates a VM with one SVM vCPU and nested paging.

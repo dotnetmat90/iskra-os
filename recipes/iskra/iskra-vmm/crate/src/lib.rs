@@ -17,6 +17,11 @@ pub const INJECT: u64 = REGS + 0x2000;
 pub const EXIT_INTR: u64 = 0x60;
 pub const EXIT_HLT: u64 = 0x78;
 pub const EXIT_IO: u64 = 0x7B;
+pub const EXIT_CPUID: u64 = 0x72;
+pub const EXIT_MSR: u64 = 0x7C;
+pub const EXIT_SHUTDOWN: u64 = 0x7F;
+pub const EXIT_XSETBV: u64 = 0x8D;
+pub const EXIT_NPF: u64 = 0x400;
 
 pub const COM1: u64 = 0x3F8;
 pub const RFLAGS_IF: u64 = 1 << 9;
@@ -70,6 +75,17 @@ impl Regs {
     }
 }
 
+impl Regs {
+    /// 64-bit long mode: CS selector 0x08 (L=1), data 0x10, 4-level paging rooted at `pml4`.
+    pub fn long64(pml4: u64) -> Self {
+        let mut r = Regs::flat32(pml4);
+        r.cr4 = 0x20; // PAE
+        r.efer = 0x500; // LME | LMA
+        r.seg[1] = Seg { selector: 0x08, attrib: 0x0A9B, limit: 0xFFFF_FFFF, base: 0 };
+        r
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Exit {
@@ -119,6 +135,23 @@ impl Vm {
     pub fn inject(&self, vector: u8) -> io::Result<()> {
         self.0.write_all_at(&(vector as usize).to_ne_bytes(), INJECT)
     }
+    /// Identity-map the first `gib` GiB (1..=512) with 2 MiB pages: PML4 at `at`, PDPT at
+    /// `at + 0x1000`, page directories after it. Returns the PML4 address for CR3.
+    pub fn identity_map_2m(&self, at: u64, gib: u64) -> io::Result<u64> {
+        let pdpt = at + 0x1000;
+        self.write_mem(at, &(pdpt | 0x3).to_le_bytes())?;
+        for g in 0..gib {
+            let pd = pdpt + 0x1000 * (g + 1);
+            self.write_mem(pdpt + 8 * g, &(pd | 0x3).to_le_bytes())?;
+            let mut table = Vec::with_capacity(4096);
+            for i in 0..512u64 {
+                table.extend_from_slice(&(((g << 30) | (i << 21)) | 0x83).to_le_bytes());
+            }
+            self.write_mem(pd, &table)?;
+        }
+        Ok(at)
+    }
+
     /// Move the guest past an instruction that exited (e.g. after emulating it).
     pub fn set_rip(&self, rip: u64) -> io::Result<()> {
         let mut r = self.regs()?;

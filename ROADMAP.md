@@ -1,6 +1,6 @@
 # Iskra roadmap
 
-Revised 2026-11-27 (hypervisor steps 1–5 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
+Revised 2026-11-27 (hypervisor steps 1–6 done the same day) after reviewing the "Iskra OS Master Blueprint" against what Redox can do today.
 The blueprint's vision stays: an OS built for AI agents, where the microkernel decides what an agent
 can see. Its 12-week schedule does not: it packs years of systems work (a hypervisor, IOMMU passthrough,
 a Linux driver VM, GPU gaming, power management) into weeks 5–12. This roadmap keeps the ambition but
@@ -104,10 +104,13 @@ The blueprint's `iskra-vmm`, modelled on FreeBSD bhyve (BSD-2-Clause, compatible
      window and delivers it right after the guest's STI; events cut off by an exit are re-delivered.
      `iskra-vmm-timer` runs a guest with its own GDT/IDT that takes five 100 ms timer ticks
      (the first through the interrupt window). The timer itself lives in the VMM, as in real VMMs.
-   - [ ] Step 6: 64-bit long-mode guests and the Linux boot protocol (load bzImage + initramfs,
-     boot params, serial console).
-   - [ ] Step 7: run Linux: either a small Rust VMM (CPUID/MSR answers, serial, PIT/PIC or LAPIC
-     timer) or a QEMU accelerator backend on `/scheme/sys/vmm` (QEMU supplies all devices).
+   - [x] **Step 6 done (2026-11-27): 64-bit guests, safe for a real OS.** Guest x87/SSE state is
+     swapped around VMRUN; XSETBV is intercepted; MSRs held in the VMCB (EFER, syscall MSRs,
+     FS/GS bases, PAT) are answered in the kernel. `iskra-vmm-long` runs a long-mode guest with its
+     own 4-level page tables that reads EFER (0x500 = LME|LMA) and prints through COM1.
+   - [ ] Step 7: run Linux with a small Rust VMM: Linux boot protocol (bzImage + initramfs, boot
+     params, e820), CPUID and MSR answers, serial console, 8259 PIC + 8254 PIT timer. A QEMU
+     accelerator backend on `/scheme/sys/vmm` remains the route to full device support.
    - [ ] Later: IOMMU (AMD-Vi) and device passthrough to the Linux VM.
    - [ ] Not yet tried on real AMD hardware or under nested KVM on Proxmox.
 4. Only after that: `dev-bridge` (.NET/Node/Docker ports over virtio-vsock), and a Linux "driver VM".

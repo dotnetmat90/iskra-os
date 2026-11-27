@@ -3,7 +3,7 @@
 #   ISKRA_CONFIG=iskra-hv ./iskra.sh build
 #   ISKRA_CONFIG=iskra-hv ISKRA_QEMU_CPU=EPYC ISKRA_BOOT_MARKER="iskra-svm: io exits: PASS" ./iskra.sh test
 # QEMU emulates AMD SVM for the EPYC model, so this works without virtualization hardware.
-# Inside: `grep iskra-svm /scheme/sys/log` (self-tests), `iskra-vmm-hello` and `iskra-vmm-timer` as root (userspace VMs).
+# Inside: `grep iskra-svm /scheme/sys/log` (self-tests), `iskra-vmm-hello`, `iskra-vmm-timer`, `iskra-vmm-long` as root (userspace VMs).
 # See ROADMAP.md, Phase 3.
 
 include = ["iskra.toml"]

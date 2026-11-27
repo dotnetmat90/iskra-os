@@ -1,0 +1,172 @@
+From ffd5c1a36468fa22d64e2eda45293975ebe9b152 Mon Sep 17 00:00:00 2001
+From: mattryznar <ryznarmat@gmail.com>
+Date: Fri, 27 Nov 2026 17:52:30 +0100
+Subject: [PATCH 6/6] Iskra: long mode and real-OS safety for vmm guests
+ (hypervisor step 6)
+
+- x87/SSE state swapped around VMRUN (FXSAVE/FXRSTOR), so guests cannot
+  corrupt the VMM process registers; guest state starts at reset values.
+- XSETBV intercepted: a guest cannot change the host XCR0.
+- RDMSR/WRMSR of MSRs held in the VMCB (EFER, STAR, LSTAR, CSTAR, SFMASK,
+  FS/GS base, KernelGsBase, SYSENTER_*, PAT) answered in the kernel; EFER.SVME
+  is hidden from and forced for the guest. Other MSRs still exit to userspace.
+---
+ src/arch/x86_shared/svm.rs | 90 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 87 insertions(+), 3 deletions(-)
+
+diff --git a/src/arch/x86_shared/svm.rs b/src/arch/x86_shared/svm.rs
+index d24e612d..2c6695cb 100644
+--- a/src/arch/x86_shared/svm.rs
++++ b/src/arch/x86_shared/svm.rs
+@@ -460,7 +460,7 @@ fn test_io_exits() -> Result<(), &'static str> {
+ // Step 4: a VM that userspace drives through /scheme/sys/vmm (see scheme/sys/vmm.rs).
+ // ---------------------------------------------------------------------------------------------
+ 
+-use alloc::{collections::BTreeMap, vec::Vec};
++use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+ use core::sync::atomic::{AtomicU64, Ordering};
+ 
+ use crate::{
+@@ -488,6 +488,50 @@ const INTCPT_INIT: u32 = 1 << 3;
+ const INTCPT_CPUID: u32 = 1 << 18;
+ const INTCPT_MSR: u32 = 1 << 28;
+ const INTCPT_SVM_INSNS: u32 = 0x7F; // VMRUN VMMCALL VMLOAD VMSAVE STGI CLGI SKINIT
++const INTCPT_XSETBV: u32 = 1 << 13; // in INST2: guest must not change the host's XCR0
++const EXIT_MSR: u64 = 0x7C;
++// VMCB state-save fields behind MSRs that VMLOAD/VMRUN switch.
++const STATE_STAR: usize = STATE + 0x200;
++const STATE_LSTAR: usize = STATE + 0x208;
++const STATE_CSTAR: usize = STATE + 0x210;
++const STATE_SFMASK: usize = STATE + 0x218;
++const STATE_KERNEL_GS_BASE: usize = STATE + 0x220;
++const STATE_SYSENTER_CS: usize = STATE + 0x228;
++const STATE_SYSENTER_ESP: usize = STATE + 0x230;
++const STATE_SYSENTER_EIP: usize = STATE + 0x238;
++
++/// MSRs whose guest values live in the VMCB; the kernel answers RDMSR/WRMSR for these itself.
++fn vmcb_msr(msr: u32) -> Option<usize> {
++    Some(match msr {
++        0xC000_0080 => STATE_EFER,
++        0xC000_0081 => STATE_STAR,
++        0xC000_0082 => STATE_LSTAR,
++        0xC000_0083 => STATE_CSTAR,
++        0xC000_0084 => STATE_SFMASK,
++        0xC000_0100 => SEG_FS + 8,
++        0xC000_0101 => SEG_GS + 8,
++        0xC000_0102 => STATE_KERNEL_GS_BASE,
++        0x174 => STATE_SYSENTER_CS,
++        0x175 => STATE_SYSENTER_ESP,
++        0x176 => STATE_SYSENTER_EIP,
++        0x277 => STATE_G_PAT,
++        _ => return None,
++    })
++}
++
++/// FXSAVE area: x87/MMX/SSE state.
++#[repr(C, align(64))]
++struct FxArea([u8; 512]);
++
++impl FxArea {
++    /// Power-on-like state: FCW 0x37F, MXCSR 0x1F80.
++    fn reset() -> Self {
++        let mut a = FxArea([0; 512]);
++        a.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
++        a.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
++        a
++    }
++}
+ 
+ /// Highest guest-physical address userspace may populate (1 TiB).
+ pub const VM_GPA_LIMIT: u64 = 1 << 40;
+@@ -559,6 +603,8 @@ pub struct Vm {
+     owned: Vec<(Frame, u32)>,
+     /// External interrupt queued by userspace, delivered as soon as the guest can take it.
+     pending_irq: Option<u8>,
++    /// Guest x87/SSE state; VMRUN does not switch it, so it is swapped with the host's per run.
++    fpu: Box<FxArea>,
+ }
+ 
+ // Only physical addresses and kernel-direct-map pointers inside; access is serialized by the scheme.
+@@ -593,14 +639,22 @@ impl Vm {
+                 INTCPT_INTR | INTCPT_NMI | INTCPT_SMI | INTCPT_INIT | INTCPT_CPUID | INTCPT_HLT
+                     | INTCPT_IO | INTCPT_MSR | INTCPT_SHUTDOWN,
+             );
+-            vmcb.w32(CTRL_INST2_INTERCEPT, INTCPT_SVM_INSNS);
++            vmcb.w32(CTRL_INST2_INTERCEPT, INTCPT_SVM_INSNS | INTCPT_XSETBV);
+             vmcb.w64(CTRL_IOPM_BASE_PA, iopm);
+             vmcb.w64(CTRL_MSRPM_BASE_PA, msrpm);
+             *vmcb.va.add(CTRL_V_INTR_MASKING) = 1; // guest IF cannot block host interrupts
+             vmcb.w64(CTRL_NP_ENABLE, 1);
+             vmcb.w64(CTRL_N_CR3, npt);
+         }
+-        Some(Self { vmcb, gpr: [0; 16], npt, pages: BTreeMap::new(), owned, pending_irq: None })
++        Some(Self {
++            vmcb,
++            gpr: [0; 16],
++            npt,
++            pages: BTreeMap::new(),
++            owned,
++            pending_irq: None,
++            fpu: Box::new(FxArea::reset()),
++        })
+     }
+ 
+     /// Host frame backing guest page `gpa_page`, allocated and mapped on first use.
+@@ -749,10 +803,33 @@ impl Vm {
+                 self.set_window(false);
+                 continue;
+             }
++            if exit.code == EXIT_MSR && self.vmcb_msr_access(exit.info1 == 1) {
++                continue;
++            }
+             return Some(exit);
+         }
+     }
+ 
++    /// RDMSR/WRMSR of an MSR kept in the VMCB: do it here and step past the instruction.
++    fn vmcb_msr_access(&mut self, write: bool) -> bool {
++        let Some(off) = vmcb_msr(self.gpr[1] as u32) else { return false };
++        let v = &self.vmcb;
++        unsafe {
++            if write {
++                let value = (self.gpr[2] << 32) | (v.r64(STATE_RAX) & 0xFFFF_FFFF);
++                let value = if off == STATE_EFER { value | EFER_SVME } else { value };
++                v.w64(off, value);
++            } else {
++                let value = v.r64(off);
++                let value = if off == STATE_EFER { value & !EFER_SVME } else { value };
++                v.w64(STATE_RAX, value & 0xFFFF_FFFF);
++                self.gpr[2] = value >> 32;
++            }
++            v.w64(STATE_RIP, v.r64(STATE_RIP) + 2); // RDMSR/WRMSR are two bytes
++        }
++        true
++    }
++
+     /// One VMRUN, until the next #VMEXIT of any kind.
+     fn enter(&mut self) -> Option<VmExit> {
+         let vmcb_pa = self.vmcb.pa;
+@@ -767,6 +844,11 @@ impl Vm {
+                 }
+                 return None;
+             };
++            // x87/SSE state: VMRUN leaves it alone, so save the host's (the VMM process') and load
++            // the guest's, then the reverse after the exit.
++            let mut host_fpu = FxArea([0; 512]);
++            asm!("fxsave64 [{}]", in(reg) host_fpu.0.as_mut_ptr());
++            asm!("fxrstor64 [{}]", in(reg) self.fpu.0.as_ptr());
+             // VMSAVE/VMLOAD swap FS, GS, TR, LDTR, KernelGsBase and the syscall MSRs, which VMRUN
+             // leaves alone; the kernel keeps per-CPU data behind GS. Guest GPRs other than
+             // RAX/RSP are loaded from and stored back to `self.gpr` around VMRUN.
+@@ -828,6 +910,8 @@ impl Vm {
+                 out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+                 out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+             );
++            asm!("fxsave64 [{}]", in(reg) self.fpu.0.as_mut_ptr());
++            asm!("fxrstor64 [{}]", in(reg) host_fpu.0.as_ptr());
+             if rflags & (1 << 9) != 0 {
+                 asm!("sti");
+             }
+-- 
+2.43.0
+

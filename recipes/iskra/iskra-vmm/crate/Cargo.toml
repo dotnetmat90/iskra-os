@@ -12,3 +12,7 @@ path = "src/main.rs"
 [[bin]]
 name = "iskra-vmm-timer"
 path = "src/bin/iskra-vmm-timer.rs"
+
+[[bin]]
+name = "iskra-vmm-long"
+path = "src/bin/iskra-vmm-long.rs"
