@@ -4,7 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ARCH=x86_64
+# Target architecture: x86_64 (default) or aarch64 (fast on Apple silicon: UTM virtualizes it).
+ARCH=${ISKRA_ARCH:-x86_64}
 CONFIG=${ISKRA_CONFIG:-iskra}
 BUILD=build/$ARCH/$CONFIG
 # Text that must appear on the serial console for a boot to count as good.

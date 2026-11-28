@@ -1,0 +1,10 @@
+# Iskra for ARM64 (aarch64): the same desktop, for UTM on Apple silicon, where an ARM64 guest runs
+# under Apple's hypervisor at near-native speed instead of being emulated like x86_64.
+#   ISKRA_ARCH=aarch64 ISKRA_CONFIG=iskra-arm64 ./iskra.sh build
+# Without the browsers of iskra.toml (no aarch64 builds), and without the hypervisor work
+# (iskra-hv: AMD SVM and AMD-Vi are x86_64-only).
+
+include = ["iskra-base.toml"]
+
+[general]
+filesystem_size = 1536

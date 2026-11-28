@@ -1,7 +1,7 @@
-# Iskra image: the upstream desktop plus Iskra identity.
+# Iskra image (x86_64): iskra-base.toml plus the browsers.
 # Iskra is an independent fork and is not affiliated with or endorsed by the Redox OS nonprofit.
 
-include = ["desktop.toml"]
+include = ["iskra-base.toml"]
 
 [general]
 # Filesystem size in MiB (desktop default is 650; the browsers need the rest)
@@ -9,57 +9,6 @@ filesystem_size = 2048
 
 [packages]
 # Browsers beyond the desktop's NetSurf. Both are upstream work-in-progress recipes;
-# upstream marks firefox "compiled, need testing".
+# upstream marks firefox "compiled, need testing". No aarch64 builds, so not in iskra-arm64.
 firefox = {}
 webkitgtk3 = {}
-# Built locally so it picks up branding/share (see recipes/gui/orbdata/recipe.toml).
-orbdata = "source"
-# Iskra's own tools: `ai` (ask any AI provider from the terminal). Local recipe, always built here.
-iskra-tools = "source"
-# Iskra's GUI (DESIGN.md): Inter font, greeter, panel and command bar.
-font-inter = "source"
-# Built from source for the boot splash patch in fbbootlogd (recipes/iskra/base/).
-base = "source"
-# Built from source to hide the pointer during the splash (recipes/iskra/orbital/).
-orbital = "source"
-iskra-shell = "source"
-
-# Start Orbital with Iskra's greeter and panel instead of orblogin and launcher
-# (overrides config/desktop-minimal.toml).
-[[files]]
-path = "/usr/lib/init.d/20_orbital"
-data = """
-requires_weak 10_net.target 20_audiod.service
-nowait VT=3 orbital iskra-greeter iskra-panel
-"""
-
-[[files]]
-path = "/etc/hostname"
-data = "iskra"
-
-# Pre-login banner; replaces the one shipped in the userutils package.
-[[files]]
-path = "/etc/issue"
-data = """
-############ Iskra ############
-# Based on Redox OS           #
-# Login with the following:   #
-# `user`                      #
-# `root`:`password`           #
-###############################
-
-"""
-
-# https://www.freedesktop.org/software/systemd/man/latest/os-release.html
-[[files]]
-path = "/usr/lib/os-release"
-data = """
-PRETTY_NAME="Iskra 0.1.0"
-NAME="Iskra"
-VERSION_ID="0.1.0"
-VERSION="0.1.0"
-ID="iskra"
-ID_LIKE="redox-os"
-
-HOME_URL="https://github.com/dotnetmat90/iskra-os"
-"""
